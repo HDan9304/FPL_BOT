@@ -1,16 +1,17 @@
 // worker.js
 // Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET
-// KV binding: FPL_BOT_KV   (we'll just write a "last_seen" key to prove KV works)
+// KV binding: FPL_BOT_KV   (stores chat:<id>:last_seen)
 
 export default {
   async fetch(req, env) {
-    const url = new URL(req.url), path = url.pathname.replace(/\/$/, "");
+    const url = new URL(req.url);
+    const path = url.pathname.replace(/\/$/, "");
 
     // Health
     if (req.method === "GET" && (path === "" || path === "/"))
-      return txt("OK");
+      return text("OK");
 
-    // One-tap: set Telegram webhook to this Worker URL
+    // Helper: set Telegram webhook to this Worker URL
     if (req.method === "GET" && path === "/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method: "POST",
@@ -23,48 +24,48 @@ export default {
         })
       });
       const j = await r.json().catch(() => ({}));
-      return txt(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, j?.ok ? 200 : 500);
+      return text(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, j?.ok ? 200 : 500);
     }
 
-    // Telegram webhook (baseline: only /start)
+    // Telegram webhook
     if (path === "/webhook/telegram") {
-      if (req.method !== "POST") return txt("Method Not Allowed", 405);
+      if (req.method !== "POST") return text("Method Not Allowed", 405);
       if (req.headers.get("x-telegram-bot-api-secret-token") !== env.TELEGRAM_WEBHOOK_SECRET)
-        return txt("Forbidden", 403);
+        return text("Forbidden", 403);
 
-      let update; try { update = await req.json(); } catch { return txt("Bad Request", 400); }
-      const msg = update?.message, chat = msg?.chat?.id, t = (msg?.text || "").trim();
-      if (!chat) return txt("ok");
+      let update;
+      try { update = await req.json(); } catch { return text("Bad Request", 400); }
 
-      // prove KV works (records last time this chat hit the bot)
-      await env.FPL_BOT_KV.put(kLastSeen(chat), String(Date.now()));
+      const msg = update?.message;
+      const chatId = msg?.chat?.id;
+      const t = (msg?.text || "").trim();
+      if (!chatId) return text("ok");
 
-      if (t && t.startsWith("/start")) {
-        await send(env, chat,
-`Bot is alive.
+      // record in KV to confirm binding works
+      await env.FPL_BOT_KV.put(kLastSeen(chatId), String(Date.now()));
 
-Use /start to see this message again.
-(£ • ← → test: normal text)`);
+      if (t.startsWith("/start")) {
+        await send(env, chatId,
+"Bot is alive.\n\nUse /start to see this message again.");
       }
 
-      return txt("ok");
+      return text("ok");
     }
 
-    return txt("Not Found", 404);
+    return text("Not Found", 404);
   }
 };
 
-/* ------------- helpers ------------- */
-const txt = (s, status=200) =>
+/* ---------- helpers ---------- */
+const text = (s, status = 200) =>
   new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 
-async function send(env, chat_id, text) {
+async function send(env, chat_id, message) {
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "content-type": "application/json; charset=utf-8" },
-    body: JSON.stringify({ chat_id, text, disable_web_page_preview: true })
-  }).catch(()=>{});
+    body: JSON.stringify({ chat_id, text: message, disable_web_page_preview: true })
+  }).catch(() => {});
 }
 
-// KV keys
 const kLastSeen = id => `chat:${id}:last_seen`;
