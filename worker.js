@@ -40,7 +40,7 @@ export default {
       switch (cmd.name) {
         case "start":    await handleStart(env, msg); break;
         case "linkteam": await handleLinkTeam(env, msg, cmd.args); break;
-        default: /* minimal fallback */ break;
+        default: break;
       }
       return text("ok");
     }
@@ -58,11 +58,11 @@ async function handleStart(env, msg) {
   const message = [
     `*${escAll(`Hey ${first}`)}!*`,
     "",
-    escAll("I'm your FPL helper. I can show deadlines, fixtures, price changes, and summarize your team."),
+    fmt("I'm your FPL helper. I can show deadlines, fixtures, price changes, and summarize your team."),
     "",
-    escAll("- Link your team: /linkteam <YourTeamID>"),
-    escAll("- Current gameweek: /gw"),
-    escAll("- Help: /help")
+    fmt("- Link your team: /linkteam <YourTeamID>"),
+    fmt("- Current gameweek: /gw"),
+    fmt("- Help: /help")
   ].join("\n");
 
   await safeSend(env, chatId, message);
@@ -73,31 +73,31 @@ async function handleLinkTeam(env, msg, args) {
   const idRaw = (args[0] || "").trim();
 
   if (!idRaw) {
-    const linesTop = [
+    const guide = [
       `*${escAll("Link your FPL team")}*`,
       "",
-      escAll("Where to find your Team ID:"),
-      escAll("1) Open fantasy.premierleague.com and go to My Team"),
-      escAll("2) Look at the URL: it shows /entry/1234567/ — that's your ID"),
-      escAll("3) Send the command like this:")
+      fmt("Where to find your Team ID:"),
+      fmt("1) Open fantasy.premierleague.com and go to My Team"),
+      // NOTE: replaced em dash (—) with ASCII dash (-) to avoid  on some clients
+      fmt("2) Look at the URL: it shows /entry/1234567/ - that's your ID"),
+      fmt("3) Send the command like this:")
     ].join("\n");
 
-    // raw fenced code block (do NOT escape)
-    const usageBlock = "```\n/linkteam 1234567\n```";
+    const usageBlock = "```\n/linkteam 1234567\n```"; // MarkdownV2 code block
 
-    await safeSend(env, chatId, `${linesTop}\n${usageBlock}`);
+    await safeSend(env, chatId, `${guide}\n${usageBlock}`);
     return;
   }
 
   const teamId = Number(idRaw);
   if (!Number.isInteger(teamId) || teamId <= 0) {
-    await safeSend(env, chatId, escAll("Please provide a valid numeric team ID, e.g. /linkteam 1234567"));
+    await safeSend(env, chatId, fmt("Please provide a valid numeric team ID, e.g. /linkteam 1234567"));
     return;
   }
 
   const entry = await fplEntry(teamId);
   if (!entry) {
-    await safeSend(env, chatId, escAll("I couldn't find that team. Double-check the ID and try again."));
+    await safeSend(env, chatId, fmt("I couldn't find that team. Double-check the ID and try again."));
     return;
   }
 
@@ -109,13 +109,13 @@ async function handleLinkTeam(env, msg, args) {
 
   const message = [
     `*${escAll("Team linked")}* `,
-    `${escAll("Team:")} ${b(teamName)}`,
-    manager ? `${escAll("Manager:")} ${escAll(manager)}` : "",
-    `${escAll("Team ID:")} ${escAll(String(teamId))}`,
+    `${fmt("Team:")} ${b(teamName)}`,
+    manager ? `${fmt("Manager:")} ${escAll(manager)}` : "",
+    `${fmt("Team ID:")} ${escAll(String(teamId))}`,
     "",
-    escAll("Next:"),
-    escAll("- /gw   (current gameweek)"),
-    escAll("- /team (your team summary)")
+    fmt("Next:"),
+    fmt("- /gw   (current gameweek)"),
+    fmt("- /team (your team summary)")
   ].filter(Boolean).join("\n");
 
   await safeSend(env, chatId, message);
@@ -161,13 +161,29 @@ function parseCommand(text) {
   return { name: cmd.slice(1).toLowerCase(), args };
 }
 
+// Normalize smart punctuation to ASCII so clients never show 
 function sanitizeAscii(s) {
-  return String(s).replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/•/g, "-").replace(/\u00A0/g, " ");
+  return String(s)
+    .replace(/[‘’]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/•/g, "-")
+    .replace(/\u2014/g, "-") // em dash —
+    .replace(/\u2013/g, "-") // en dash –
+    .replace(/\u00A0/g, " ");
 }
 
-function escAll(s) { return String(s).replace(/[_*[\]()~`>#+\-=|{}.!]/g, "\\$&"); }
+// Escape EVERYTHING Telegram cares about in MarkdownV2
+function escAll(s) {
+  // Added "<" to be extra-safe for strings containing placeholders like <YourTeamID>
+  return String(s).replace(/[_*[\]()~`>#+\-=|{}.!<]/g, "\\$&");
+}
+
+// Convenience: sanitize + escape in one go
+function fmt(s) { return escAll(sanitizeAscii(s)); }
+
 function b(s) { return `*${escAll(s)}*`; }
-function stripMd(s) { return s.replace(/\\([_*[\]()~`>#+\-=|{}.!])/g, "$1"); }
+
+function stripMd(s) { return s.replace(/\\([_*[\]()~`>#+\-=|{}.!<])/g, "$1"); }
 
 /* ---------- KV keys ---------- */
 const kLastSeen = id => `chat:${id}:last_seen`;
