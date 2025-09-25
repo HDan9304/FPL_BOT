@@ -1,0 +1,10 @@
+{
+  "name": "fpl-telegram-bot",
+  "main": "worker.js",                   // <-- entry point file in repo root
+  "compatibility_date": "2025-09-25",
+
+  // Bind your KV namespace (create it once in Dashboard or via wrangler, then paste its ID here)
+  "kv_namespaces": [
+    { "binding": "FPL_BOT_KV", "id": "0db14f68c3a8451cb0d70904c1800ea5" }
+  ]
+}
