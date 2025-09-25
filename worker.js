@@ -19,7 +19,6 @@ export default {
         body: JSON.stringify({
           url: `${url.origin}/webhook/telegram`,
           secret_token: env.TELEGRAM_WEBHOOK_SECRET,
-          // We only need messages for now (reply keyboard will send text messages)
           allowed_updates: ["message"],
           drop_pending_updates: true
         })
@@ -53,9 +52,9 @@ export default {
         return text("ok");
       }
 
-      // Unknown / fallback: stay silent or send a tiny nudge
-      // (Optional) uncomment to gently point users to /start
-      // await sendMd(env, chatId, "Type /start to see what I can do.");
+      // (Optional) nudge unknowns
+      // await safeSend(env, chatId, escAll("Type /start to see what I can do."));
+
       return text("ok");
     }
 
@@ -69,21 +68,21 @@ async function handleStart(env, msg) {
   const chatId = msg.chat.id;
   const firstName = (msg.from?.first_name && msg.from.first_name.trim()) || "there";
 
-  // Compose MarkdownV2 message. Escape dynamic bits to avoid formatting errors.
-  const title = b(`Hey ${esc(firstName)}!`) + " ðŸ‘‹";
-  const body = [
-    "Iâ€™m your FPL helper bot. I can show gameweek deadlines, fixtures, price changes, and summarize your team.",
+  // Build message with fully-escaped MarkdownV2 segments
+  const lines = [
+    `*${escAll(`Hey ${firstName}!`)}* `,
     "",
-    "â€¢ Use /link <YourTeamID> to connect your FPL team",
-    "â€¢ Try /gw for the current gameweek overview",
-    "â€¢ Need commands? /help",
+    escAll("I’m your FPL helper bot. I can show gameweek deadlines, fixtures, price changes, and summarize your team."),
     "",
-    i("Tip: you can set your timezone with") + " /tz Asia/Kuala_Lumpur"
-  ].join("\n");
+    escAll("• Use /link <YourTeamID> to connect your FPL team"),
+    escAll("• Try /gw for the current gameweek overview"),
+    escAll("• Need commands? /help"),
+    "",
+    `${i("Tip: you can set your timezone with")} ${escAll("/tz Asia/Kuala_Lumpur")}`
+  ];
+  const message = lines.join("\n");
 
-  const message = [title, "", body].join("\n");
-
-  // Reply keyboard (buttons: on). This sends actual messages when tappedâ€”no callback handling needed.
+  // Reply keyboard (buttons: on) — sends real text messages
   const reply_keyboard = {
     keyboard: [
       [{ text: "/help" }, { text: "/gw" }],
@@ -93,55 +92,75 @@ async function handleStart(env, msg) {
     one_time_keyboard: true
   };
 
-  await sendMd(env, chatId, message, reply_keyboard);
+  await safeSend(env, chatId, message, reply_keyboard);
 }
 
-/* ---------- helpers ---------- */
+/* ---------- HTTP helper ---------- */
 
-// Plain text response helper (HTTP)
 const text = (s, status = 200) =>
   new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 
-// Telegram send (plain)
-async function send(env, chat_id, message) {
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "content-type": "application/json; charset=utf-8" },
-    body: JSON.stringify({ chat_id, text: message, disable_web_page_preview: true })
-  }).catch(() => {});
-}
+/* ---------- robust Telegram send helpers ---------- */
 
-// Telegram send (MarkdownV2 + optional reply keyboard)
-async function sendMd(env, chat_id, message, replyKeyboard /* object or undefined */) {
-  const payload = {
+// Sends with MarkdownV2; if Telegram rejects (parse error), falls back to plain text.
+async function safeSend(env, chat_id, message, replyKeyboard) {
+  const mdPayload = {
     chat_id,
     text: message,
     parse_mode: "MarkdownV2",
     disable_web_page_preview: true
   };
-  if (replyKeyboard) payload.reply_markup = replyKeyboard;
+  if (replyKeyboard) mdPayload.reply_markup = replyKeyboard;
 
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "content-type": "application/json; charset=utf-8" },
-    body: JSON.stringify(payload)
-  }).catch(() => {});
+  const r1 = await tg(env, "sendMessage", mdPayload);
+  if (r1?.ok) return;
+
+  // If MarkdownV2 failed (commonly "can't parse entities"), try plain text
+  const plainPayload = {
+    chat_id,
+    text: stripMd(message),
+    disable_web_page_preview: true
+  };
+  if (replyKeyboard) plainPayload.reply_markup = replyKeyboard;
+
+  await tg(env, "sendMessage", plainPayload);
 }
+
+// Low-level Telegram call that returns the JSON (no silent catch)
+async function tg(env, method, payload) {
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: JSON.stringify(payload)
+    });
+    return await r.json();
+  } catch {
+    return { ok: false };
+  }
+}
+
+/* ---------- parsing & formatting utils ---------- */
 
 // Command parser for "/command arg1 arg2"
 function parseCommand(text) {
   if (!text.startsWith("/")) return { name: "", args: [] };
   const parts = text.split(/\s+/);
-  const name = parts[0].slice(1).toLowerCase(); // "/Start" â†’ "start"
+  const name = parts[0].slice(1).toLowerCase(); // "/Start"  "start"
   const args = parts.slice(1);
   return { name, args };
 }
 
-// MarkdownV2 escaping (per Telegram docs) for dynamic content
-function esc(s) {
+// Escape EVERYTHING Telegram cares about in MarkdownV2
+function escAll(s) {
   return String(s).replace(/[_*[\]()~`>#+\-=|{}.!]/g, "\\$&");
 }
-function b(s) { return `*${esc(s)}*`; }  // bold
-function i(s) { return `_${esc(s)}_`; }  // italic
+function i(s) { return `_${escAll(s)}_`; }
 
+// For fallback: remove backslashes that were for MarkdownV2 so plain text reads fine
+function stripMd(s) {
+  return s.replace(/\\([_*[\]()~`>#+\-=|{}.!])/g, "$1");
+}
+
+/* ---------- KV keys ---------- */
 const kLastSeen = id => `chat:${id}:last_seen`;
