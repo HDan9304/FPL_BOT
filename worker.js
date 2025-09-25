@@ -1,16 +1,16 @@
 // worker.js
-// Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET
+// Secrets required: TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET
 
 export default {
-  async fetch(req, env, ctx) {
+  async fetch(req, env) {
     const url = new URL(req.url);
     const path = url.pathname.replace(/\/$/, "");
 
-    // health
+    // Health
     if (req.method === "GET" && (path === "" || path === "/"))
-      return new Response("OK", { headers: { "content-type": "text/plain; charset=utf-8" } });
+      return text("OK");
 
-    // quick helper to set webhook to this Worker URL
+    // One-tap: set Telegram webhook to this Worker URL
     if (req.method === "GET" && path === "/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method: "POST",
@@ -23,43 +23,76 @@ export default {
         })
       });
       const j = await r.json().catch(() => ({}));
-      const ok = j && j.ok;
-      return new Response(ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, {
-        status: ok ? 200 : 500,
-        headers: { "content-type": "text/plain; charset=utf-8" }
-      });
+      return text(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, j?.ok ? 200 : 500);
     }
 
-    // telegram webhook
+    // Telegram webhook
     if (path === "/webhook/telegram") {
-      if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+      if (req.method !== "POST") return text("Method Not Allowed", 405);
       if (req.headers.get("x-telegram-bot-api-secret-token") !== env.TELEGRAM_WEBHOOK_SECRET)
-        return new Response("Forbidden", { status: 403 });
+        return text("Forbidden", 403);
 
       let update;
-      try { update = await req.json(); } catch { return new Response("Bad Request", { status: 400 }); }
+      try { update = await req.json(); } catch { return text("Bad Request", 400); }
 
-      const msg = update?.message;
-      const chatId = msg?.chat?.id;
-      const text = (msg?.text || "").trim();
+      const chat = update?.message?.chat?.id;
+      const t = (update?.message?.text || "").trim();
 
-      if (chatId && text.startsWith("/start")) {
-        await send(env, chatId,
-          "Welcome! This bot is alive.\n\nUse /start to see this message again."
-        );
+      if (!chat) return text("ok");
+
+      if (t.startsWith("/start")) {
+        await sendCodeV2(env, chat, symbolsDemo());
+        return text("ok");
       }
 
-      return new Response("ok");
+      if (t.startsWith("/symbols")) {
+        await sendCodeV2(env, chat, symbolsDemo());
+        return text("ok");
+      }
+
+      // ignore other messages quietly
+      return text("ok");
     }
 
-    return new Response("Not Found", { status: 404 });
+    return text("Not Found", 404);
   }
 };
 
-async function send(env, chat_id, text) {
+/* ---------------- helpers ---------------- */
+const text = (s, status = 200) =>
+  new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
+
+// MarkdownV2 code block sender (monospace font, best glyph coverage)
+function escapeForCodeBlock(s) {
+  // Inside MarkdownV2 triple backticks, you only need to avoid literal backticks.
+  return (s || "").replace(/`/g, "'"); // swap backticks with apostrophes
+}
+
+async function sendCodeV2(env, chat_id, body) {
+  const payload = {
+    chat_id,
+    text: "```\n" + escapeForCodeBlock(body) + "\n```",
+    parse_mode: "MarkdownV2",
+    disable_web_page_preview: true
+  };
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "content-type": "application/json; charset=utf-8" },
-    body: JSON.stringify({ chat_id, text, disable_web_page_preview: true })
+    body: JSON.stringify(payload)
   }).catch(() => {});
+}
+
+// Minimal, useful symbol set for FPL
+function symbolsDemo() {
+  return [
+    "Symbols check",
+    "",
+    "Currency: £  $  €  ¥",
+    "Arrows:   ←  →  ↑  ↓",
+    "Bullet:   •",
+    "",
+    "Example:",
+    "Bank: £1.5m",
+    "Team value: £100.2m",
+  ].join("\n");
 }
