@@ -1,5 +1,5 @@
 // worker.js
-// Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET
+// Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET (leave EMPTY TEMPORARILY to bypass check for debugging)
 // KV binding: FPL_BOT_KV  (stores chat -> teamId)
 
 export default {
@@ -7,8 +7,8 @@ export default {
     const url = new URL(req.url), path = url.pathname.replace(/\/$/, "");
 
     // Health
-    if (req.method === "GET" && (path === "" || path === "/"))
-      return plain("OK");
+    if (req.method === "GET" && (path === "" || path === "/")) return plain("OK");
+    if (req.method === "GET" && path === "/health") return plain("healthy");
 
     // One-tap: set Telegram webhook to this Worker URL
     if (req.method === "GET" && path === "/init-webhook") {
@@ -17,7 +17,7 @@ export default {
         headers: { "content-type": "application/json; charset=utf-8" },
         body: JSON.stringify({
           url: `${url.origin}/webhook/telegram`,
-          secret_token: env.TELEGRAM_WEBHOOK_SECRET,
+          secret_token: env.TELEGRAM_WEBHOOK_SECRET || undefined,
           allowed_updates: ["message"],
           drop_pending_updates: true
         })
@@ -29,10 +29,21 @@ export default {
     // Telegram webhook
     if (path === "/webhook/telegram") {
       if (req.method !== "POST") return plain("Method Not Allowed", 405);
-      if (req.headers.get("x-telegram-bot-api-secret-token") !== env.TELEGRAM_WEBHOOK_SECRET)
-        return plain("Forbidden", 403);
 
-      let update; try { update = await req.json(); } catch { return plain("Bad Request", 400); }
+      // Secret check (bypass if secret is empty for debugging)
+      const configured = env.TELEGRAM_WEBHOOK_SECRET && env.TELEGRAM_WEBHOOK_SECRET.length > 0;
+      const header = req.headers.get("x-telegram-bot-api-secret-token");
+      if (configured && header !== env.TELEGRAM_WEBHOOK_SECRET) {
+        console.log("Forbidden: secret mismatch", { got: header, expected: "***" });
+        return plain("Forbidden", 403);
+      }
+
+      let update;
+      try { update = await req.json(); } catch { return plain("Bad Request", 400); }
+
+      // Log a tiny breadcrumb so you can see hits in Live Logs
+      console.log("Webhook hit", { messageType: Object.keys(update || {}), date: Date.now() });
+
       const msg = update?.message, chat = msg?.chat?.id, t = (msg?.text || "").trim();
       if (!chat || !t) return plain("ok");
 
@@ -47,7 +58,7 @@ export default {
             "",
             "I’ll reply with value, bank, points and rank.",
             "",
-            "Symbols test: £ • ← →"
+            "Symbols: £ • ← → (normal text)"
           ].join("\n")
         );
         return plain("ok");
@@ -57,11 +68,7 @@ export default {
       if (t.startsWith("/linkteam")) {
         const teamId = (t.split(/\s+/)[1] || "").trim();
         if (!/^\d{1,10}$/.test(teamId)) {
-          await sendMD(env, chat, [
-            "*Usage*",
-            "`/linkteam 1234567`",
-            "Find your FPL team ID in your team page URL."
-          ].join("\n"));
+          await sendMD(env, chat, "*Usage*\n`/linkteam 1234567`\nFind your FPL team ID in your team page URL.");
           return plain("ok");
         }
 
@@ -93,7 +100,8 @@ export default {
           ].join("\n");
 
           await sendMD(env, chat, card);
-        } catch {
+        } catch (e) {
+          console.log("entry fetch error", e?.message || e);
           await sendMD(env, chat, "Linked, but I couldn't fetch your team info just now. Please try again in a minute.");
         }
         return plain("ok");
@@ -112,7 +120,7 @@ const plain = (s, status = 200) =>
 
 const kTeam = id => `chat:${id}:team`;
 
-/* Send MarkdownV2 (no code box). We escape dynamic content safely. */
+/* Send MarkdownV2 (no code box). Escape dynamic content safely. */
 async function sendMD(env, chat_id, mdText) {
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
@@ -167,12 +175,7 @@ function toMillions(n) {
   if (!isFinite(v)) return "0.0";
   return (v / 10).toFixed(1); // FPL stores tenths of a million
 }
-
-const num = n => {
-  const v = Number(n);
-  return Number.isFinite(v) ? v : 0;
-};
-
+const num = n => { const v = Number(n); return Number.isFinite(v) ? v : 0; };
 function formatRank(n) {
   if (!Number.isFinite(n) || n <= 0) return "-";
   return String(Math.floor(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
