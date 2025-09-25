@@ -66,21 +66,22 @@ export default {
 
 async function handleStart(env, msg) {
   const chatId = msg.chat.id;
-  const firstName = (msg.from?.first_name && msg.from.first_name.trim()) || "there";
+  const firstName = sanitizeAscii((msg.from?.first_name && msg.from.first_name.trim()) || "there");
 
-  // Build message with fully-escaped MarkdownV2 segments
+  // Compose MarkdownV2 message using ASCII-friendly copy
+  const title = `*${escAll(`Hey ${firstName}!`)}* `;
+
   const lines = [
-    `*${escAll(`Hey ${firstName}!`)}* `,
+    escAll("I'm your FPL helper bot. I can show gameweek deadlines, fixtures, price changes, and summarize your team."),
     "",
-    escAll("I’m your FPL helper bot. I can show gameweek deadlines, fixtures, price changes, and summarize your team."),
-    "",
-    escAll("• Use /link <YourTeamID> to connect your FPL team"),
-    escAll("• Try /gw for the current gameweek overview"),
-    escAll("• Need commands? /help"),
+    escAll("- Use /link <YourTeamID> to connect your FPL team"),
+    escAll("- Try /gw for the current gameweek overview"),
+    escAll("- Need commands? /help"),
     "",
     `${i("Tip: you can set your timezone with")} ${escAll("/tz Asia/Kuala_Lumpur")}`
   ];
-  const message = lines.join("\n");
+
+  const message = [title, "", ...lines].join("\n");
 
   // Reply keyboard (buttons: on) — sends real text messages
   const reply_keyboard = {
@@ -149,6 +150,16 @@ function parseCommand(text) {
   const name = parts[0].slice(1).toLowerCase(); // "/Start"  "start"
   const args = parts.slice(1);
   return { name, args };
+}
+
+// Normalize smart punctuation to ASCII so clients never show 
+// Apply to any user-provided names/inputs you show back to users.
+function sanitizeAscii(s) {
+  return String(s)
+    .replace(/[‘’]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/•/g, "-")
+    .replace(/\u00A0/g, " "); // non-breaking space  normal space
 }
 
 // Escape EVERYTHING Telegram cares about in MarkdownV2
