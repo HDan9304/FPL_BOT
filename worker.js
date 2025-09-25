@@ -1,14 +1,14 @@
 // worker.js
-// Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET (leave EMPTY TEMPORARILY to bypass check for debugging)
-// KV binding: FPL_BOT_KV  (stores chat -> teamId)
+// Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET
+// KV binding: FPL_BOT_KV   (we'll just write a "last_seen" key to prove KV works)
 
 export default {
   async fetch(req, env) {
     const url = new URL(req.url), path = url.pathname.replace(/\/$/, "");
 
     // Health
-    if (req.method === "GET" && (path === "" || path === "/")) return plain("OK");
-    if (req.method === "GET" && path === "/health") return plain("healthy");
+    if (req.method === "GET" && (path === "" || path === "/"))
+      return txt("OK");
 
     // One-tap: set Telegram webhook to this Worker URL
     if (req.method === "GET" && path === "/init-webhook") {
@@ -17,166 +17,54 @@ export default {
         headers: { "content-type": "application/json; charset=utf-8" },
         body: JSON.stringify({
           url: `${url.origin}/webhook/telegram`,
-          secret_token: env.TELEGRAM_WEBHOOK_SECRET || undefined,
+          secret_token: env.TELEGRAM_WEBHOOK_SECRET,
           allowed_updates: ["message"],
           drop_pending_updates: true
         })
       });
       const j = await r.json().catch(() => ({}));
-      return plain(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, j?.ok ? 200 : 500);
+      return txt(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, j?.ok ? 200 : 500);
     }
 
-    // Telegram webhook
+    // Telegram webhook (baseline: only /start)
     if (path === "/webhook/telegram") {
-      if (req.method !== "POST") return plain("Method Not Allowed", 405);
+      if (req.method !== "POST") return txt("Method Not Allowed", 405);
+      if (req.headers.get("x-telegram-bot-api-secret-token") !== env.TELEGRAM_WEBHOOK_SECRET)
+        return txt("Forbidden", 403);
 
-      // Secret check (bypass if secret is empty for debugging)
-      const configured = env.TELEGRAM_WEBHOOK_SECRET && env.TELEGRAM_WEBHOOK_SECRET.length > 0;
-      const header = req.headers.get("x-telegram-bot-api-secret-token");
-      if (configured && header !== env.TELEGRAM_WEBHOOK_SECRET) {
-        console.log("Forbidden: secret mismatch", { got: header, expected: "***" });
-        return plain("Forbidden", 403);
-      }
-
-      let update;
-      try { update = await req.json(); } catch { return plain("Bad Request", 400); }
-
-      // Log a tiny breadcrumb so you can see hits in Live Logs
-      console.log("Webhook hit", { messageType: Object.keys(update || {}), date: Date.now() });
-
+      let update; try { update = await req.json(); } catch { return txt("Bad Request", 400); }
       const msg = update?.message, chat = msg?.chat?.id, t = (msg?.text || "").trim();
-      if (!chat || !t) return plain("ok");
+      if (!chat) return txt("ok");
 
-      // /start
-      if (t.startsWith("/start")) {
-        await sendMD(env, chat,
-          [
-            "*Welcome to the FPL bot*",
-            "",
-            "*Link your team*",
-            "`/linkteam <FPL_TEAM_ID>`",
-            "",
-            "I’ll reply with value, bank, points and rank.",
-            "",
-            "Symbols: £ • ← → (normal text)"
-          ].join("\n")
-        );
-        return plain("ok");
+      // prove KV works (records last time this chat hit the bot)
+      await env.FPL_BOT_KV.put(kLastSeen(chat), String(Date.now()));
+
+      if (t && t.startsWith("/start")) {
+        await send(env, chat,
+`Bot is alive.
+
+Use /start to see this message again.
+(£ • ← → test: normal text)`);
       }
 
-      // /linkteam <id>
-      if (t.startsWith("/linkteam")) {
-        const teamId = (t.split(/\s+/)[1] || "").trim();
-        if (!/^\d{1,10}$/.test(teamId)) {
-          await sendMD(env, chat, "*Usage*\n`/linkteam 1234567`\nFind your FPL team ID in your team page URL.");
-          return plain("ok");
-        }
-
-        await env.FPL_BOT_KV.put(kTeam(chat), teamId, { expirationTtl: 31536000 });
-
-        try {
-          const [bootstrap, entry] = await Promise.all([getBootstrap(), getEntry(teamId)]);
-
-          const club     = teamNameFromId(bootstrap, entry?.favourite_team) || "-";
-          const valueM   = toMillions(entry?.last_deadline_value);
-          const bankM    = toMillions(entry?.last_deadline_bank);
-          const points   = num(entry?.summary_overall_points);
-          const rank     = num(entry?.summary_overall_rank);
-          const manager  = [entry?.player_first_name, entry?.player_last_name].filter(Boolean).join(" ").trim() || "-";
-          const teamName = entry?.name || `Team ${teamId}`;
-
-          const m = (label, value) => `*${esc(label)}*: ${esc(value)}`;
-          const card = [
-            "*Linked!*",
-            "",
-            m("Team",    teamName),
-            m("Manager", manager),
-            m("Club",    club),
-            "",
-            m("Value",   `£${valueM}m`),
-            m("Bank",    `£${bankM}m`),
-            m("Points",  String(points)),
-            m("Rank",    formatRank(rank))
-          ].join("\n");
-
-          await sendMD(env, chat, card);
-        } catch (e) {
-          console.log("entry fetch error", e?.message || e);
-          await sendMD(env, chat, "Linked, but I couldn't fetch your team info just now. Please try again in a minute.");
-        }
-        return plain("ok");
-      }
-
-      return plain("ok");
+      return txt("ok");
     }
 
-    return plain("Not Found", 404);
+    return txt("Not Found", 404);
   }
 };
 
-/* ------------ helpers ------------ */
-const plain = (s, status = 200) =>
+/* ------------- helpers ------------- */
+const txt = (s, status=200) =>
   new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 
-const kTeam = id => `chat:${id}:team`;
-
-/* Send MarkdownV2 (no code box). Escape dynamic content safely. */
-async function sendMD(env, chat_id, mdText) {
+async function send(env, chat_id, text) {
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "content-type": "application/json; charset=utf-8" },
-    body: JSON.stringify({
-      chat_id,
-      text: mdText,
-      parse_mode: "MarkdownV2",
-      disable_web_page_preview: true
-    })
-  }).catch(() => {});
+    body: JSON.stringify({ chat_id, text, disable_web_page_preview: true })
+  }).catch(()=>{});
 }
 
-/* Escape dynamic text for MarkdownV2 (keeps £, •, arrows as-is) */
-function esc(s) {
-  return (s ?? "")
-    .toString()
-    .replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
-}
-
-/* ------------ FPL helpers ------------ */
-async function getBootstrap() {
-  const url = "https://fantasy.premierleague.com/api/bootstrap-static/";
-  const cache = caches.default;
-  const req = new Request(url, { cf: { cacheTtl: 900, cacheEverything: true } });
-  let res = await cache.match(req);
-  if (!res) {
-    res = await fetch(req);
-    res = new Response(res.body, res);
-    res.headers.set("Cache-Control", "public, max-age=900");
-    await cache.put(req, res.clone());
-  }
-  return res.json();
-}
-
-async function getEntry(teamId) {
-  const res = await fetch(`https://fantasy.premierleague.com/api/entry/${teamId}/`, {
-    headers: { "accept": "application/json" }
-  });
-  if (!res.ok) throw new Error("entry fetch failed");
-  return res.json();
-}
-
-function teamNameFromId(bootstrap, id) {
-  if (!id) return null;
-  const t = bootstrap?.teams?.find(x => x?.id === id);
-  return t?.name || null;
-}
-
-function toMillions(n) {
-  const v = Number(n);
-  if (!isFinite(v)) return "0.0";
-  return (v / 10).toFixed(1); // FPL stores tenths of a million
-}
-const num = n => { const v = Number(n); return Number.isFinite(v) ? v : 0; };
-function formatRank(n) {
-  if (!Number.isFinite(n) || n <= 0) return "-";
-  return String(Math.floor(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-}
+// KV keys
+const kLastSeen = id => `chat:${id}:last_seen`;
