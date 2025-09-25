@@ -1,6 +1,6 @@
 // worker.js
 // Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET
-// KV binding: FPL_BOT_KV   (stores chat:<id>:last_seen)
+// KV binding: FPL_BOT_KV   (stores chat:<id>:last_seen, user:<chatId>:profile)
 
 export default {
   async fetch(req, env) {
@@ -45,15 +45,20 @@ export default {
       // record in KV to confirm binding works
       await env.FPL_BOT_KV.put(kLastSeen(chatId), String(Date.now()));
 
-      // --- Minimal router (we only handle /start for now) ---
+      // --- Minimal router ---
       const cmd = parseCommand(t);
-      if (cmd.name === "start") {
-        await handleStart(env, msg);
-        return text("ok");
+      switch (cmd.name) {
+        case "start":
+          await handleStart(env, msg);
+          break;
+        case "linkteam":
+          await handleLinkTeam(env, msg, cmd.args);
+          break;
+        default:
+          // (Optional) nudge unknowns
+          // await safeSend(env, chatId, escAll("Type /start to see what I can do."));
+          break;
       }
-
-      // (Optional) nudge unknowns
-      // await safeSend(env, chatId, escAll("Type /start to see what I can do."));
 
       return text("ok");
     }
@@ -74,7 +79,7 @@ async function handleStart(env, msg) {
   const lines = [
     escAll("I'm your FPL helper bot. I can show gameweek deadlines, fixtures, price changes, and summarize your team."),
     "",
-    escAll("- Use /link <YourTeamID> to connect your FPL team"),
+    escAll("- Use /linkteam <YourTeamID> to connect your FPL team"),
     escAll("- Try /gw for the current gameweek overview"),
     escAll("- Need commands? /help"),
     "",
@@ -83,11 +88,79 @@ async function handleStart(env, msg) {
 
   const message = [title, "", ...lines].join("\n");
 
-  // Reply keyboard (buttons: on) — sends real text messages
   const reply_keyboard = {
     keyboard: [
       [{ text: "/help" }, { text: "/gw" }],
-      [{ text: "/link" }]
+      [{ text: "/linkteam" }]
+    ],
+    resize_keyboard: true,
+    one_time_keyboard: true
+  };
+
+  await safeSend(env, chatId, message, reply_keyboard);
+}
+
+async function handleLinkTeam(env, msg, args) {
+  const chatId = msg.chat.id;
+
+  // 1) Parse & validate argument
+  const idRaw = (args[0] || "").trim();
+  if (!idRaw) {
+    const usage = [
+      `*${escAll("Link your FPL team")}*`,
+      "",
+      escAll("Usage:"),
+      escAll("/linkteam <YourTeamID>"),
+      "",
+      escAll("Example:"),
+      escAll("/linkteam 1234567")
+    ].join("\n");
+    await safeSend(env, chatId, usage);
+    return;
+  }
+  const teamId = Number(idRaw);
+  if (!Number.isInteger(teamId) || teamId <= 0) {
+    await safeSend(env, chatId, escAll("Please provide a valid numeric team ID, e.g. /linkteam 1234567"));
+    return;
+  }
+
+  // 2) Validate with FPL API
+  const entry = await fplEntry(env, teamId);
+  if (!entry) {
+    await safeSend(env, chatId, escAll("I couldn't find that team. Double-check the ID and try again."));
+    return;
+  }
+
+  // 3) Save to KV profile
+  const now = Date.now();
+  const profile = {
+    teamId,
+    createdAt: now,
+    updatedAt: now
+    // tz will be added later by /tz
+  };
+  await env.FPL_BOT_KV.put(kUserProfile(chatId), JSON.stringify(profile));
+
+  // 4) Confirm to user
+  const teamName = sanitizeAscii(`${entry.name || "Team"}`);
+  const playerName = sanitizeAscii(`${entry.player_first_name || ""} ${entry.player_last_name || ""}`.trim());
+
+  const title = `*${escAll("Team linked successfully")}* `;
+  const lines = [
+    `${escAll("Team:")} ${b(teamName)}`,
+    playerName ? `${escAll("Manager:")} ${escAll(playerName)}` : "",
+    `${escAll("Team ID:")} ${escAll(String(teamId))}`,
+    "",
+    escAll("You're all set! Try these:"),
+    escAll("- /gw  (current gameweek overview)"),
+    escAll("- /team  (your team summary)")
+  ].filter(Boolean);
+
+  const message = [title, "", ...lines].join("\n");
+
+  const reply_keyboard = {
+    keyboard: [
+      [{ text: "/gw" }, { text: "/team" }]
     ],
     resize_keyboard: true,
     one_time_keyboard: true
@@ -101,7 +174,7 @@ async function handleStart(env, msg) {
 const text = (s, status = 200) =>
   new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 
-/* ---------- robust Telegram send helpers ---------- */
+/* ---------- Telegram send helpers ---------- */
 
 // Sends with MarkdownV2; if Telegram rejects (parse error), falls back to plain text.
 async function safeSend(env, chat_id, message, replyKeyboard) {
@@ -116,7 +189,6 @@ async function safeSend(env, chat_id, message, replyKeyboard) {
   const r1 = await tg(env, "sendMessage", mdPayload);
   if (r1?.ok) return;
 
-  // If MarkdownV2 failed (commonly "can't parse entities"), try plain text
   const plainPayload = {
     chat_id,
     text: stripMd(message),
@@ -141,6 +213,24 @@ async function tg(env, method, payload) {
   }
 }
 
+/* ---------- FPL API helpers ---------- */
+
+async function fplEntry(env, teamId) {
+  const url = `https://fantasy.premierleague.com/api/entry/${teamId}/`;
+  try {
+    const r = await fetch(url, { cf: { cacheTtl: 0 } });
+    if (!r.ok) return null;
+    // Defensive: some 200s can still be HTML; try/catch JSON
+    const j = await r.json().catch(() => null);
+    if (!j || typeof j !== "object") return null;
+    // Basic shape check
+    if (j.id !== teamId && typeof j.id !== "number") return null;
+    return j;
+  } catch {
+    return null;
+  }
+}
+
 /* ---------- parsing & formatting utils ---------- */
 
 // Command parser for "/command arg1 arg2"
@@ -153,7 +243,6 @@ function parseCommand(text) {
 }
 
 // Normalize smart punctuation to ASCII so clients never show 
-// Apply to any user-provided names/inputs you show back to users.
 function sanitizeAscii(s) {
   return String(s)
     .replace(/[‘’]/g, "'")
@@ -162,10 +251,11 @@ function sanitizeAscii(s) {
     .replace(/\u00A0/g, " "); // non-breaking space  normal space
 }
 
-// Escape EVERYTHING Telegram cares about in MarkdownV2
+// MarkdownV2 escaping
 function escAll(s) {
   return String(s).replace(/[_*[\]()~`>#+\-=|{}.!]/g, "\\$&");
 }
+function b(s) { return `*${escAll(s)}*`; }
 function i(s) { return `_${escAll(s)}_`; }
 
 // For fallback: remove backslashes that were for MarkdownV2 so plain text reads fine
@@ -175,3 +265,4 @@ function stripMd(s) {
 
 /* ---------- KV keys ---------- */
 const kLastSeen = id => `chat:${id}:last_seen`;
+const kUserProfile = chatId => `user:${chatId}:profile`;
