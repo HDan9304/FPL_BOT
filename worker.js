@@ -1,11 +1,11 @@
-// worker.js — no keyboards at all (no inline, no reply), commands-only UX
+// worker.js — commands only (no keyboards), /transfer adds Priority Watchlist for weak picks
 
 export default {
   async fetch(req, env) {
     const u = new URL(req.url), p = u.pathname.replace(/\/$/,"");
     if (req.method==="GET" && (p===""||p==="/")) return R("OK");
 
-    // Helper: set webhook (message-only)
+    // Init webhook (message-only)
     if (req.method==="GET" && p==="/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method:"POST",
@@ -190,7 +190,9 @@ async function handleTransfer(env, chatId, args){
     if(a.length>1) return "DGW: "+a.map(v=>`${abbr(v.oppId)} (${v.home?"H":"A"},${v.diff})`).join(" | ");
     const v=a[0]; return `${abbr(v.oppId)} (${v.home?"H":"A"},${v.diff})`;
   };
+  const tough=(teamId,gw)=>{const a=fixMap.get(key(gw,teamId))||[];if(a.length===0)return {label:"BLANK",isBlank:true,isTough:false};const toughAny=a.some(v=>v.diff>=4);return {label:fmtF(teamId,gw),isBlank:false,isTough:toughAny,isDGW:a.length>1}};
 
+  // Build Base Squad groups with fixtures
   const picks=(base?.picks||[]).slice().sort((a,b)=>a.position-b.position), XI=picks.filter(p=>p.position<=11), BN=picks.filter(p=>p.position>=12);
   const mk=(p)=>{ const e=elMap.get(p.element); if(!e) return null;
     const sp=sellPrice(p,e);
@@ -205,6 +207,54 @@ async function handleTransfer(env, chatId, args){
   }
   for (const p of BN){ const ln=mk(p); if(ln) Bench.push(ln); }
 
+  // ----- Risk flags & Priority Watchlist -----
+  const riskItems=[];
+  const riskFor=(p)=>{ const e=elMap.get(p.element); if(!e) return null;
+    const N=tough(e.team,nextId), N1=horizon>1?tough(e.team,nextId+1):null;
+    const chance=Number.isFinite(e.chance_of_playing_next_round)?e.chance_of_playing_next_round:null;
+    const status=e.status||"";
+    const injFlag=(status!=="a") || (chance!=null && chance<75);               // injured/doubtful/suspended or <75%
+    const lowMin=(chance!=null && chance>0 && chance<75);                      // explicit minutes risk
+    const blankFlag=N.isBlank;                                                 // blank in N
+    const toughN=N.isTough;                                                    // difficulty >=4 in N
+    const toughN1=N1?N1.isTough:false;                                        // difficulty >=4 in N+1
+    const dgwGood=N.isDGW && !toughN;                                         // DGW but not tough → not a negative
+    // price-drop heuristic: large net transfers out and no fall yet this event
+    const netOut=(e.transfers_out_event||0)-(e.transfers_in_event||0);
+    const dropRisk=(netOut>20000)&&((e.cost_change_event_fall||0)===0);
+
+    let score=0;
+    if(blankFlag) score+=50;
+    if(injFlag)   score+=40;
+    if(lowMin)    score+=30;
+    if(toughN)    score+=25;
+    if(toughN1)   score+=10;
+    if(dropRisk)  score+=10;
+    if(dgwGood)   score-=10; // soften if DGW & not tough
+
+    const flags=[];
+    if(blankFlag) flags.push("BLANK");
+    if(N.isDGW)   flags.push("DGW");
+    if(injFlag)   flags.push(chance===0?"OUT":"FLAG");
+    else if(lowMin) flags.push("MIN?");
+    if(toughN)    flags.push(`Tough N`);
+    if(toughN1)   flags.push(`Tough N+1`);
+    if(dropRisk)  flags.push("£ drop?");
+
+    const baseName=`${e.web_name} (${abbr(e.team)}, ${pos(e.element_type)})`;
+    const annotate = [`N: ${N.label}`];
+    if(horizon>1) annotate.push(`N+1: ${N1?N1.label:"—"}`);
+    return {score, text:`${esc(baseName)} — ${esc(flags.join(", ")||"OK")}\n   ${esc(annotate.join("  |  "))}`};
+  };
+
+  for(const p of picks){
+    const r=riskFor(p);
+    if(r) riskItems.push(r);
+  }
+  riskItems.sort((a,b)=>b.score-a.score);
+  const watchTop = riskItems.filter(r=>r.score>0).slice(0,8).map(r=>`• ${r.text}`).join("\n");
+
+  // ----- Header + body -----
   const fmtUTC=d=>{const z=n=>String(n).padStart(2,"0");return `${d.getUTCFullYear()}-${z(d.getUTCMonth()+1)}-${z(d.getUTCDate())} ${z(d.getUTCHours())}:${z(d.getUTCMinutes())} UTC`};
   const countdown=ms=>{ if(ms<=0) return "deadline passed"; const d=Math.floor(ms/864e5), h=Math.floor(ms%864e5/36e5), m=Math.floor(ms%36e5/6e4); return `${d}d ${h}h ${m}m` };
   const dlStr=dlRaw?fmtUTC(new Date(dlRaw)):"—", leftMs=dlMs!=null?dlMs-Date.now():null, leftStr=leftMs!=null?countdown(leftMs):"—";
@@ -231,11 +281,12 @@ async function handleTransfer(env, chatId, args){
     `\n${B("Bench")} \n${bullets(Bench)}`
   ].join("\n\n");
 
-  const html = [head,"",line1,line2,line3,line4,baseTitle,body].filter(Boolean).join("\n");
+  const watchTitle = watchTop ? `\n${B("Priority Watchlist (GW N)")} ${esc("(highest concern first)")}\n` : "";
+  const html = [head,"",line1,line2,line3,line4,baseTitle,body,watchTitle,watchTop].filter(Boolean).join("\n");
   await sendHTML(env, chatId, html);
 }
 
-/* ---------- Telegram send helper (HTML only, no reply_markup) ---------- */
+/* ---------- Telegram send helper (HTML only) ---------- */
 async function sendHTML(env, chat_id, html){
   const p={chat_id, text: html, parse_mode:"HTML", disable_web_page_preview:true};
   try {
