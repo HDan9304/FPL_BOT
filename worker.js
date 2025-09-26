@@ -10,7 +10,7 @@ export default {
     // Health
     if (req.method === "GET" && (path === "" || path === "/")) return text("OK");
 
-    // Webhook init helper
+    // One-click webhook init
     if (req.method === "GET" && path === "/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method: "POST",
@@ -54,6 +54,10 @@ export default {
   }
 };
 
+/* ---------- HTTP helper (single definition) ---------- */
+const text = (s, status = 200) =>
+  new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
+
 /* ---------- commands ---------- */
 
 async function handleStart(env, msg) {
@@ -81,7 +85,7 @@ async function handleLinkTeam(env, msg, args) {
     const guide = [
       `<b>${htmlEsc("Link Your FPL Team")}</b>`,
       ``,
-      `${boldLabel("Where To Find Team ID")} ${htmlEsc("Open fantasy.premierleague.com → My Team")}`,
+      `${boldLabel("Where To Find Team ID")} ${htmlEsc("Open fantasy.premierleague.com -> My Team")}`,
       `${htmlEsc("Look at the URL:")} <code>/entry/1234567/</code> ${htmlEsc("- that's your ID")}`,
       ``,
       `${boldLabel("How To Link")}`,
@@ -144,8 +148,8 @@ async function handleMyTeam(env, msg) {
   const elements = boot.elements || [];
   const teams = boot.teams || [];
   const elById = new Map(elements.map(e => [e.id, e]));
-  const teamShort = (teamIdNum) => {
-    const t = teams.find(x => x.id === teamIdNum);
+  const teamShort = (tid) => {
+    const t = teams.find(x => x.id === tid);
     return t ? t.short_name : "";
   };
 
@@ -183,10 +187,8 @@ async function handleMyTeam(env, msg) {
   (live.elements || []).forEach(e => {
     const id = e.id;
     const total = e.stats?.total_points ?? 0;
-    // Bonus can be inside explain (array of arrays) or stats.bonus depending on season
     let bonus = 0;
     if (Array.isArray(e.explain)) {
-      // e.explain => [{fixture, stats:[{identifier, points, value}]}, ...]
       for (const ex of e.explain) {
         for (const st of (ex.stats || [])) if (st.identifier === "bonus") bonus += (st.points || 0);
       }
@@ -201,7 +203,6 @@ async function handleMyTeam(env, msg) {
   const starters = picksArr.filter(p => p.position <= 11);
   const bench    = picksArr.filter(p => p.position >= 12);
 
-  const mulLabel = (m) => m === 0 ? "bench" : (m === 1 ? "" : `×${m}`);
   const fmtMoney = (v) => (typeof v === "number" ? (v/10).toFixed(1) : "-");
   const fmtNum   = (n) => (typeof n === "number" ? n.toLocaleString("en-GB") : "-");
 
@@ -222,12 +223,12 @@ async function handleMyTeam(env, msg) {
 
     const rawPts = liveStats.total;
     const effPts = rawPts * mult;
-    const bonusSuffix = liveStats.bonus > 0 ? ` ${htmlEsc(`(+${liveStats.bonus} bonus)`)}` : "";
+    const bonusSuffix = liveStats.bonus > 0 ? ` ${htmlEsc("(+" + liveStats.bonus + " bonus)")}` : "";
+    const multNote = mult === 0 ? " (bench)" : (mult === 1 ? "" : " (x" + mult + "=" + effPts + ")");
 
-    const tags = isCap ? " (C)" : (isVC ? " (VC)" : "");
-    const multNote = mult === 0 ? " (bench)" : (mult === 1 ? "" : ` (×${mult}=${effPts})`);
+    const tag = isCap ? " (C)" : (isVC ? " (VC)" : "");
 
-    return `${htmlEsc(name)} ${htmlEsc(`(${pos} - ${club})`)}\n${boldLabel("Points")} ${htmlEsc(String(rawPts))}${bonusSuffix}${htmlEsc(multNote)}`;
+    return `${htmlEsc(name + tag)} ${htmlEsc("(" + pos + " - " + club + ")")}\n${boldLabel("Points")} ${htmlEsc(String(rawPts))}${bonusSuffix}${htmlEsc(multNote)}`;
   };
 
   const startersLines = starters.map(lineForPick).filter(Boolean);
@@ -237,7 +238,7 @@ async function handleMyTeam(env, msg) {
 
   const header = [
     `<b>${htmlEsc(teamName)}</b>`,
-    htmlEsc(`Gameweek ${gw} (current)`),
+    htmlEsc("Gameweek " + gw + " (current)")
   ].join("\n");
 
   const overview = [
@@ -260,19 +261,16 @@ async function handleMyTeam(env, msg) {
     overview,
     ``,
     `${boldLabel("Starting XI")}`,
-    startersLines.length ? startersLines.map(s => `• ${s}`).join("\n\n") : htmlEsc("No starters found."),
+    startersLines.length ? startersLines.map(s => `- ${s}`).join("\n\n") : htmlEsc("No starters found."),
     ``,
     `${boldLabel("Bench")}`,
-    benchLines.length ? benchLines.map(s => `• ${s}`).join("\n\n") : htmlEsc("No bench found."),
+    benchLines.length ? benchLines.map(s => `- ${s}`).join("\n\n") : htmlEsc("No bench found."),
     ``,
     chipsBlock
   ].join("\n");
 
   await sendHTML(env, chatId, html, keyboardMain());
 }
-
-/* ---------- HTTP ---------- */
-const text = (s, status = 200) => new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 
 /* ---------- Telegram (HTML) ---------- */
 
@@ -373,7 +371,7 @@ function remainingChips(playedNames) {
   const rem = [];
   // Wildcards: up to 2 per season
   const wcLeft = Math.max(0, 2 - counts.wildcard);
-  if (wcLeft > 0) rem.push(wcLeft === 2 ? "Wildcard ×2" : "Wildcard");
+  if (wcLeft > 0) rem.push(wcLeft === 2 ? "Wildcard x2" : "Wildcard");
   if (counts.freehit === 0) rem.push("Free Hit");
   if (counts.bench_boost === 0) rem.push("Bench Boost");
   if (counts.triple_captain === 0) rem.push("Triple Captain");
@@ -402,9 +400,6 @@ function stripHtml(s) { return s.replace(/<[^>]+>/g, ""); }
 
 // Label helper: **Bold first word**
 function boldLabel(label) { return `<b>${htmlEsc(label)}:</b>`; }
-
-/* ---------- HTTP helper ---------- */
-const text = (s, status = 200) => new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 
 /* ---------- KV keys ---------- */
 const kLastSeen     = id => `chat:${id}:last_seen`;
