@@ -1,5 +1,5 @@
 {
-  "name": "fpl-bot",
+  "name": "fpl-telegram-bot",
   "main": "worker.js",
   "compatibility_date": "2025-09-26",
 
