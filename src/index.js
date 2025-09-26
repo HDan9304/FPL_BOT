@@ -1,12 +1,13 @@
-// src/index.js — Worker entry/router
+// index.js — Cloudflare Worker entry + Telegram webhook router
+// Env: TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, FPL_BOT_KV (KV)
 
-import startCmd     from "./src/commands/start.js";
-import linkCmd      from "./src/commands/link.js";
-import unlinkCmd    from "./src/commands/unlink.js";
-import transferCmd  from "./src/commands/transfer.js";
-import planCmd      from "./src/commands/plan.js";
-import chipCmd      from "./src/commands/chip.js";     // <— NEW
-import { send }     from "./src/utils/telegram.js";
+import startCmd    from "./command/start.js";
+import linkCmd     from "./command/link.js";
+import unlinkCmd   from "./command/unlink.js";
+import transferCmd from "./command/transfer.js";
+import planCmd     from "./command/plan.js";
+import chipCmd     from "./command/chip.js";
+import { send }    from "./utils/telegram.js";
 
 const text = (s, status = 200) =>
   new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
@@ -19,7 +20,7 @@ export default {
     // Health
     if (req.method === "GET" && (path === "" || path === "/")) return text("OK");
 
-    // Webhook init
+    // Helper: set Telegram webhook to this Worker URL
     if (req.method === "GET" && path === "/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method: "POST",
@@ -38,53 +39,42 @@ export default {
     // Telegram webhook
     if (path === "/webhook/telegram") {
       if (req.method !== "POST") return text("Method Not Allowed", 405);
-      if (req.headers.get("x-telegram-bot-api-secret-token") !== env.TELEGRAM_WEBHOOK_SECRET) return text("Forbidden", 403);
+      if (req.headers.get("x-telegram-bot-api-secret-token") !== env.TELEGRAM_WEBHOOK_SECRET)
+        return text("Forbidden", 403);
 
       let update;
       try { update = await req.json(); } catch { return text("Bad Request", 400); }
 
       const msg = update?.message;
-      if (!msg) return text("ok");
-      const chatId = msg?.chat?.id;
-      const t = (msg?.text || "").trim();
-      if (!chatId) return text("ok");
+      if (!msg?.chat?.id) return text("ok");
+      const chatId = msg.chat.id;
+      const raw = (msg.text || "").trim();
 
-      const { name, arg } = parseCmd(t);
-
-      switch (name) {
-        case "start":
-        case "":
-          await startCmd(env, chatId, msg.from);
-          break;
-        case "link":
-          await linkCmd(env, chatId, arg);
-          break;
-        case "unlink":
-          await unlinkCmd(env, chatId);
-          break;
-        case "transfer":
-          await transferCmd(env, chatId, arg);
-          break;
-        case "plan":
-          await planCmd?.(env, chatId, arg);
-          break;
-        case "chip":                         // <— NEW
-          await chipCmd(env, chatId, arg);
-          break;
-        default:
-          await startCmd(env, chatId, msg.from);
+      // Simple command parse
+      let cmd = "", arg = "";
+      if (raw.startsWith("/")) {
+        const sp = raw.indexOf(" ");
+        cmd = (sp === -1 ? raw : raw.slice(0, sp)).replace(/@\S+$/,"").toLowerCase();
+        arg = sp === -1 ? "" : raw.slice(sp + 1).trim();
       }
-      return text("ok");
+
+      // Route
+      try {
+        if (!cmd || cmd === "/start")     { await startCmd(env, chatId, msg.from); return text("ok"); }
+        if (cmd === "/link")              { await linkCmd(env, chatId, arg);        return text("ok"); }
+        if (cmd === "/unlink")            { await unlinkCmd(env, chatId);           return text("ok"); }
+        if (cmd === "/transfer")          { await transferCmd(env, chatId, arg);    return text("ok"); }
+        if (cmd === "/plan")              { await planCmd(env, chatId, arg);        return text("ok"); }
+        if (cmd === "/chip")              { await chipCmd(env, chatId, arg);        return text("ok"); }
+        // Unknown -> nudge
+        await send(env, chatId, "Unknown command. Try /start", "HTML");
+        return text("ok");
+      } catch (e) {
+        await send(env, chatId, "Something went wrong. Try again in a bit.", "HTML");
+        return text("ok");
+      }
     }
 
     return text("Not Found", 404);
   }
 };
-
-function parseCmd(t) {
-  if (!t.startsWith("/")) return { name: "", arg: "" };
-  const space = t.indexOf(" ");
-  const name = (space === -1 ? t.slice(1) : t.slice(1, space)).toLowerCase();
-  const arg  = (space === -1 ? "" : t.slice(space+1)).trim();
-  return { name, arg };
-}
