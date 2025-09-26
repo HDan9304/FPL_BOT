@@ -37,7 +37,6 @@ export default {
       const t = (msg?.text || "").trim();
       if (!chatId) return text("ok");
 
-      // heartbeat
       await env.FPL_BOT_KV.put(kLastSeen(chatId), String(Date.now()));
 
       const cmd = parseCommand(t);
@@ -175,18 +174,26 @@ async function handleMyTeam(env, msg) {
   const value  = thisGw?.value ?? history?.current?.slice(-1)?.[0]?.value ?? entry?.value ?? null; // tenths
   const bank   = thisGw?.bank ?? history?.current?.slice(-1)?.[0]?.bank ?? entry?.bank ?? null;
 
-  // Picks & live map
+  // Picks & live map (+minutes)
   const picksArr = (picks.picks || []).slice().sort((a,b) => a.position - b.position);
   const starters = picksArr.filter(p => p.position <= 11);
   const bench    = picksArr.filter(p => p.position >= 12);
 
   const liveById = new Map();
   (live.elements || []).forEach(e => {
-    let bonus = 0;
+    let bonus = 0, minutes = 0;
     if (Array.isArray(e.explain)) {
-      for (const ex of e.explain) for (const st of (ex.stats || [])) if (st.identifier === "bonus") bonus += (st.points || 0);
-    } else if (typeof e.stats?.bonus === "number") bonus = e.stats.bonus;
-    liveById.set(e.id, { total: e.stats?.total_points ?? 0, bonus });
+      for (const ex of e.explain) {
+        for (const st of (ex.stats || [])) {
+          if (st.identifier === "bonus")   bonus += (st.points || 0);
+          if (st.identifier === "minutes") minutes += (st.value  || 0);
+        }
+      }
+    }
+    if (typeof e.stats?.bonus === "number")   bonus   = e.stats.bonus;
+    if (typeof e.stats?.minutes === "number") minutes = e.stats.minutes;
+    const total = e.stats?.total_points ?? 0;
+    liveById.set(e.id, { total, bonus, minutes });
   });
 
   // Captain / VC
@@ -199,7 +206,7 @@ async function handleMyTeam(env, msg) {
   const lineForPick = (p) => {
     const el = elById.get(p.element);
     if (!el) return null;
-    const liveStats = liveById.get(p.element) || { total: 0, bonus: 0 };
+    const liveStats = liveById.get(p.element) || { total: 0, bonus: 0, minutes: 0 };
     const name  = `${el.web_name}`;
     const club  = clubAbbr(el.team);
     const pos   = posName(el.element_type);
@@ -232,7 +239,10 @@ async function handleMyTeam(env, msg) {
   // Chips
   const activeChip = picks.active_chip || null;
   const played = (history.chips || []).map(c => c.name);
-  const remaining = remainingChips(played); // "Wildcard" appears once if any left
+  const remaining = remainingChips(played); // Wildcard shown once if any remain
+
+  // --- Projected Auto-subs (formation-valid, bench order, GK special) ---
+  const autosubs = simulateAutosubs(starters, bench, liveById, elById);
 
   // --- UI ---
   const teamName = sanitizeAscii(`${entry.name || "Team"}`);
@@ -264,6 +274,12 @@ async function handleMyTeam(env, msg) {
 
   const benchBlock = benchLines.length ? prefixedSection("Bench", benchLines) : "";
 
+  const autosubBlock = autosubs.length
+    ? prefixedSection("Auto-subs (projected)", autosubs.map(
+        s => `${htmlEsc(`${s.outName} (${s.outClub}, ${s.outPos}) -> ${s.inName} (${s.inClub}, ${s.inPos})`)}`
+      ))
+    : ""; // handled by prefixedSection blank line
+
   const chipsBottom = `${boldLabel("Available Chips")} ${htmlEsc((remaining.join(", ") || "None").trim())}`;
 
   const html = [
@@ -272,8 +288,10 @@ async function handleMyTeam(env, msg) {
     summaryLine1,
     summaryLine2,
     "",
+    "", // extra blank line between Captain row and GK block (requested)
     startersBlock,
-    benchBlock,     // prefixedSection already adds a blank line after it
+    benchBlock,
+    autosubBlock,
     chipsBottom
   ].filter(Boolean).join("\n");
 
@@ -389,6 +407,82 @@ function prettyChip(name) {
   return map[name] || name;
 }
 
+// Projected auto-subs simulation
+function simulateAutosubs(starters, bench, liveById, elById) {
+  // Build counts
+  const posOf = (elId) => ({1:"GK",2:"DEF",3:"MID",4:"FWD"}[elById.get(elId)?.element_type] || "");
+  const minutes = (elId) => (liveById.get(elId)?.minutes || 0);
+
+  // Current counts include the original XI positions
+  const counts = { GK: 0, DEF: 0, MID: 0, FWD: 0 };
+  for (const p of starters) counts[posOf(p.element)]++;
+
+  // Identify zero-minute starters
+  const zeroGK = starters.find(p => posOf(p.element)==="GK" && minutes(p.element)===0) || null;
+  const zeroOutfield = starters.filter(p => posOf(p.element)!=="GK" && minutes(p.element)===0);
+
+  const subs = [];
+  const usedBench = new Set();
+
+  // GK rule: only GK can replace GK, bench order still applies (GK is typically first bench slot)
+  const benchGK = bench.find(p => posOf(p.element)==="GK");
+  if (zeroGK && benchGK && minutes(benchGK.element)>0) {
+    subs.push({
+      outId: zeroGK.element, inId: benchGK.element,
+      outPos: "GK", inPos: "GK",
+      outName: elById.get(zeroGK.element)?.web_name || "",
+      inName:  elById.get(benchGK.element)?.web_name || "",
+      outClub: clubShort(elById.get(zeroGK.element), elById),
+      inClub:  clubShort(elById.get(benchGK.element), elById)
+    });
+    usedBench.add(benchGK.element);
+    // counts remain GK:1 (swap GK for GK)
+  }
+
+  // Outfield: walk bench in order (skip GK), apply formation constraints
+  const benchOutfield = bench.filter(p => posOf(p.element)!=="GK");
+  const minReq = { DEF: 3, MID: 2, FWD: 1 };
+
+  // Helper to get club short
+  function clubShort(el, elByIdMap) {
+    // We don't have teams here; name only. Leave empty string for brevity.
+    return ""; // club printed earlier in main lines; autosub section shows names only or add clubs if needed.
+  }
+
+  for (const bp of benchOutfield) {
+    if (usedBench.has(bp.element)) continue;
+    if (minutes(bp.element) <= 0) continue; // bench player didn't play
+
+    const bPos = posOf(bp.element);
+    // Try to replace one of the zero-minute starters that keeps formation valid
+    let replacedIndex = -1;
+    for (let i = 0; i < zeroOutfield.length; i++) {
+      const sp = zeroOutfield[i];
+      const sPos = posOf(sp.element);
+      // simulate
+      const c = { ...counts };
+      c[sPos]--; c[bPos]++;
+      if (c.DEF >= minReq.DEF && c.MID >= minReq.MID && c.FWD >= minReq.FWD) {
+        replacedIndex = i;
+        counts[sPos]--; counts[bPos]++; // commit
+        subs.push({
+          outId: sp.element, inId: bp.element,
+          outPos: sPos, inPos: bPos,
+          outName: elById.get(sp.element)?.web_name || "",
+          inName:  elById.get(bp.element)?.web_name || "",
+          outClub: "", inClub: ""
+        });
+        zeroOutfield.splice(i,1);
+        usedBench.add(bp.element);
+        break;
+      }
+    }
+    // if none valid, this bench player is skipped
+  }
+
+  return subs;
+}
+
 // Section renderer: inline label + first item, indented rest, and a trailing blank line
 function prefixedSection(label, lines) {
   if (!lines.length) return "";
@@ -415,9 +509,7 @@ function stripHtml(s) { return s.replace(/<[^>]+>/g, ""); }
 
 // Label helpers
 function boldLabel(label) { return `<b>${htmlEsc(label)}:</b>`; }
-// "Label: value" with bolded first word, safe-escaped
 function boldFirst(label, value) { return `<b>${htmlEsc(label)}:</b> ${htmlEsc(String(value))}`; }
-// Join parts with " | "
 function joinWithPipes(parts) { return parts.filter(Boolean).join(` ${htmlEsc("|")} `); }
 
 /* ---------- KV keys ---------- */
