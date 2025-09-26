@@ -1,225 +1,305 @@
-// src/commands/plan.js
-// /plan  -> best XI for current squad (no changes)
-// /planb -> apply Plan B from /transfer then best XI
-// /planc -> apply Plan C from /transfer then best XI
-// /pland -> apply Plan D from /transfer then best XI
+// src/commands/plan.js — formation planner with parity to /transfer
+// Usage:
+//   /plan      -> Plan A (no moves; base 15 saved by /transfer)
+//   /planb     -> Plan B (apply 1-move from /transfer snapshot)
+//   /planc     -> Plan C (apply 2-move from /transfer snapshot)
+//   /pland     -> Plan D (apply 3-move from /transfer snapshot)
+//
+// This relies on KV state written by src/commands/transfer.js at key: plan:${chatId}:transfers
 
 import { send } from "../utils/telegram.js";
 import { esc } from "../utils/fmt.js";
 
-const B = (s) => `<b>${esc(s)}</b>`;
-const kUser = (id) => `user:${id}:profile`;
 const kPlan = (id) => `plan:${id}:transfers`;
+const kUser = (id) => `user:${id}:profile`;
 
-export default async function plan(env, chatId, variant = "A") {
-  // 1) Ensure linked team
-  const prof = safeParse(await env.FPL_BOT_KV.get(kUser(chatId)));
-  const teamId = prof?.teamId;
+const B = (s) => `<b>${esc(s)}</b>`;
+const gbp = (n) => (n == null ? "—" : `£${Number(n).toFixed(1)}m`);
+const posName = (t) => ({1:"GK",2:"DEF",3:"MID",4:"FWD"})[t] || "?";
+
+/* ================================================================
+   Entry
+================================================================ */
+export default async function plan(env, chatId, rawArg = "") {
+  // Detect which plan: A|B|C|D
+  const mode = detectMode(rawArg); // "A" | "B" | "C" | "D"
+
+  // Ensure team linked (for nicer error)
+  const pRaw = env.FPL_BOT_KV ? await env.FPL_BOT_KV.get(kUser(chatId)) : null;
+  if (!pRaw) {
+    await send(env, chatId, `${B("Not linked")} Use /link &lt;TeamID&gt; first.`, "HTML");
+    return;
+  }
+  const { teamId } = JSON.parse(pRaw) || {};
   if (!teamId) {
-    await send(env, chatId, `${B("No team linked")} — use /link <team_id> first.`, "HTML");
+    await send(env, chatId, `${B("Not linked")} Use /link &lt;TeamID&gt; first.`, "HTML");
     return;
   }
 
-  // 2) Fetch core data
+  // Must have a recent /transfer run to seed parity state
+  const saved = env.FPL_BOT_KV ? await env.FPL_BOT_KV.get(kPlan(chatId)) : null;
+  if (!saved) {
+    await send(env, chatId, `${B("No plan saved")} Run /transfer first to generate Plans A–D.`, "HTML");
+    return;
+  }
+  let state;
+  try { state = JSON.parse(saved); } catch { state = null; }
+  if (!state || !Array.isArray(state.base)) {
+    await send(env, chatId, `${B("No plan saved")} Run /transfer first.`, "HTML");
+    return;
+  }
+
+  // Fetch FPL data we need to render
   const [bootstrap, fixtures, entry] = await Promise.all([
     getJSON("https://fantasy.premierleague.com/api/bootstrap-static/"),
     getJSON("https://fantasy.premierleague.com/api/fixtures/"),
     getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/`)
   ]);
   if (!bootstrap || !fixtures || !entry) {
-    await send(env, chatId, `${B("Couldn’t fetch data")} — FPL might be rate-limiting. Try again.`, "HTML");
+    await send(env, chatId, "Couldn't fetch FPL data. Try again.", "HTML");
     return;
   }
-  const curGW  = currentGw(bootstrap);
-  const nextGW = nextGwId(bootstrap);
+  const teams = Object.fromEntries((bootstrap?.teams || []).map(t => [t.id, t]));
+  const elsById = Object.fromEntries((bootstrap?.elements || []).map(e => [e.id, e]));
 
-  // Picks for current GW (used as the "base" squad)
-  const picks = await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`);
-  if (!picks) {
-    await send(env, chatId, `${B("Couldn’t fetch your team")} — is it private?`, "HTML");
+  const nextGW = getNextGwId(bootstrap);
+
+  // Determine squad of 15 for selected plan (A base, B/C/D snapshots from /transfer)
+  let squadIds = null;
+  if (mode === "A") squadIds = state.base.slice(0, 15);
+  else {
+    // Prefer snapshots if present; else, apply moves recorded
+    const snap = state.squads?.[mode];
+    if (Array.isArray(snap) && snap.length) {
+      squadIds = snap.slice(0, 15);
+    } else {
+      const moves = (state.plans?.[mode] || []);
+      squadIds = applyMoves(state.base, moves).slice(0, 15);
+    }
+  }
+
+  // Build XI recommendation for THIS squad (no transfers here)
+  const cfg = state.model || { h:3, min:78, damp:0.94 };
+  const best = bestXIForGw(
+    squadIds.map(id => elsById[id]).filter(Boolean),
+    bootstrap, fixtures, cfg, nextGW
+  );
+  if (!best) {
+    await send(env, chatId, "Couldn't form a valid XI from this plan.", "HTML");
     return;
   }
 
-  // 3) Prepare "hypothetical" squad id list, applying transfer plan if variant=B/C/D
-  const byId = Object.fromEntries((bootstrap?.elements || []).map(e => [e.id, e]));
-  const baseIds = (picks?.picks || []).map(p => p.element);
+  // Captain / Vice suggestions (within this XI)
+  const ranked = best.xi.slice().sort((a,b)=>b.score-a.score);
+  const C  = ranked[0];
+  const VC = ranked[1] || null;
 
-  let appliedMoves = [];
-  if (variant !== "A") {
-    const saved = safeParse(await env.FPL_BOT_KV.get(kPlan(chatId)));
-    const key = variantKey(variant); // "B" | "C" | "D"
-    appliedMoves = resolveMoves(saved, nextGW, key); // array of {outId,inId}
-  }
-  const hypoIds = applyMoves(baseIds, appliedMoves);
-
-  // 4) Best XI for NEXT GW on that hypothetical squad
-  const xi = bestXIForNextGW(hypoIds, bootstrap, fixtures, nextGW);
-  if (!xi) {
-    await send(env, chatId, `${B("No valid XI")} — not enough available players for GW${nextGW}.`, "HTML");
-    return;
-  }
-
-  // 5) Captaincy from XI (C then VC)
-  const rankedXI = xi.xi.slice().sort((a,b)=>b.score-a.score);
-  const C  = rankedXI[0];
-  const VC = rankedXI.find(p => p.id !== C.id) || rankedXI[1] || C;
-  const tag = (r) => r.id === C.id ? `${r.name} (C)` : (r.id === VC.id ? `${r.name} (VC)` : r.name);
-
-  // 6) Header (same style as /transfer)
-  const bank = deriveBank(entry, picks);
-  // We keep FT/hit simple here — your transfer command handles cost logic; plan is a view.
-  const header = [
-    `${B(`${entry.name || "Team"}`)} ${esc("|")} ${B(`GW ${nextGW} — Plan${variant === "A" ? "" : " " + variant}`)}`,
-    `${B("Bank")} ${esc(fmtGBP(bank))} ${esc("|")} ${B("Free Transfer")} ${esc("1 (assumed)")} ${esc("|")} ${B("Hit")} ${esc("0 (view only)")}`
+  // Header — mirror /transfer header style
+  const head = [
+    `${B("Team")}: ${esc(entry?.name || "—")} | ${B("GW")}: ${nextGW} — ${mode==="A"?"Plan A (no moves)":"Plan "+mode} — Formation`,
+    `${B("Model")}: ${cfg.chase ? "Chasing" : "Pro Auto"} — h=${cfg.h}, min=${cfg.min}% , damp=${cfg.damp}${cfg.ft!=null?` | ${B("FT (assumed)")}: ${cfg.ft}`:""}`
   ].join("\n");
 
-  // 7) Body
+  // Body
   const lines = [];
-  lines.push(header);
+  lines.push(`${B("Recommended XI")}: ${best.gwShape}  |  ${B("Projected")} ${best.total.toFixed(2)}`);
   lines.push("");
-  lines.push(`${B("Captaincy")}`);
-  lines.push(`• ${esc(C.name)} — ${esc(`${C.pos} ${C.team}`)} (${esc(fmtScore(C.score))})`);
-  lines.push(`• ${esc(VC.name)} — ${esc(`${VC.pos} ${VC.team}`)} (${esc(fmtScore(VC.score))})`);
+  lines.push(B("GKP"));
+  lines.push(`• ${playerLine(best.xi.find(r=>r.type===1), teams, true, C, VC)}`);
   lines.push("");
-  lines.push(`${B("Best Formation")} ${esc(xi.shape)}  ${esc("|")}  ${B("Projected XI")} ${esc(xi.total.toFixed(1))}`);
-  if (xi.relaxed) lines.push(esc("(Minutes threshold was relaxed to fill 11)"));
+  lines.push(B("DEF"));
+  best.xi.filter(r=>r.type===2).forEach(r => lines.push(`• ${playerLine(r, teams, false, C, VC)}`));
   lines.push("");
-  lines.push(B("Starters"));
-  lines.push(section("GK",  xi.xi.filter(x=>x.type===1).map(r=>`• ${esc(tag(r))} — ${esc(r.team)}`)));
-  lines.push(section("DEF", xi.xi.filter(x=>x.type===2).map(r=>`• ${esc(tag(r))} — ${esc(r.team)}`)));
-  lines.push(section("MID", xi.xi.filter(x=>x.type===3).map(r=>`• ${esc(tag(r))} — ${esc(r.team)}`)));
-  lines.push(section("FWD", xi.xi.filter(x=>x.type===4).map(r=>`• ${esc(tag(r))} — ${esc(r.team)}`)));
+  lines.push(B("MID"));
+  best.xi.filter(r=>r.type===3).forEach(r => lines.push(`• ${playerLine(r, teams, false, C, VC)}`));
   lines.push("");
-  lines.push(`${B("Bench order")} ${esc(xi.benchLine || "—")}`);
+  lines.push(B("FWD"));
+  best.xi.filter(r=>r.type===4).forEach(r => lines.push(`• ${playerLine(r, teams, false, C, VC)}`));
   lines.push("");
-  // Quick links to toggle variants
-  lines.push(`${B("Variants")}`);
-  lines.push(`/plan  ·  /planb  ·  /planc  ·  /pland`);
 
-  await send(env, chatId, lines.join("\n"), "HTML");
+  lines.push(`${B("Bench order")}: ${best.benchLine || "—"}`);
+  lines.push(`${B("Minutes threshold")}: ${cfg.min}%`);
+  if (best.riskyXI?.length) lines.push(`${B("Risk in XI")}: ${best.riskyXI.join(", ")}`);
+  if (best.relaxed) lines.push(`(Minutes filter relaxed to fill positions.)`);
+
+  // Footer quick nav (parity)
+  lines.push("");
+  lines.push(esc("View other plans: /planb · /planc · /pland  |  Rebuild: /transfer"));
+
+  const html = [head, "", ...lines].join("\n");
+  await send(env, chatId, html, "HTML");
 }
 
-/* ---------------- helpers ---------------- */
-
-function section(label, arr){ return [`${B(label)}:`, arr.length?arr.join("\n"):"• —"].join("\n"); }
-function fmtScore(x){ return x.toFixed(2); }
-function fmtGBP(n){ return `£${Number(n).toFixed(1)}m`; }
-function safeParse(s){ try { return JSON.parse(s||""); } catch { return null; } }
-async function getJSON(u){ try{ const r=await fetch(u,{cf:{cacheTtl:30,cacheEverything:true}}); if(!r.ok) return null; return r.json(); }catch{return null;} }
-
-function currentGw(bootstrap){
-  const ev=bootstrap?.events||[];
-  return ev.find(e=>e.is_current)?.id ?? ev.find(e=>e.is_next)?.id ?? ev.find(e=>!e.finished)?.id ?? ev.at(-1)?.id ?? 1;
-}
-function nextGwId(bootstrap){
-  const ev=bootstrap?.events||[];
-  const nxt=ev.find(e=>e.is_next); if(nxt) return nxt.id;
-  const cur=ev.find(e=>e.is_current);
-  if(!cur) return ev.find(e=>!e.finished)?.id ?? ev.at(-1)?.id ?? 1;
-  const i=ev.findIndex(e=>e.id===cur.id);
-  return ev[i+1]?.id ?? cur.id;
+/* ================================================================
+   Mode detection
+================================================================ */
+function detectMode(arg){
+  const a = String(arg||"").trim().toLowerCase();
+  if (a.includes("planb") || a==="b") return "B";
+  if (a.includes("planc") || a==="c") return "C";
+  if (a.includes("pland") || a==="d") return "D";
+  // Some routers call plan(env,id,"B") directly; accept that:
+  if (/^[abcd]$/i.test(a)) return a.toUpperCase();
+  return "A";
 }
 
-function variantKey(v){
-  const u = String(v||"A").toUpperCase();
-  return u==="B"?"B":u==="C"?"C":u==="D"?"D":"A";
-}
-function resolveMoves(saved, nextGW, key){
-  if (!saved || saved.gw !== nextGW || !saved.plans) return [];
-  if (key==="B") return saved.plans.B || [];
-  if (key==="C") return saved.plans.C || [];
-  if (key==="D") return saved.plans.D || [];
-  return [];
-}
-function applyMoves(idList, moves){
-  const ids = idList.slice();
-  for (const m of moves) {
-    const i = ids.indexOf(m.outId);
-    if (i !== -1) ids.splice(i,1);
-    ids.push(m.inId);
-  }
-  return ids;
-}
+/* ================================================================
+   XI builder (same spirit as /transfer scoring)
+================================================================ */
+function bestXIForGw(squadEls, bootstrap, fixtures, cfg, gw){
+  const minPct = cfg.min || 78;
 
-function deriveBank(entry, picks){
-  if (picks?.entry_history?.bank != null) return picks.entry_history.bank/10;
-  if (entry?.last_deadline_bank != null)   return entry.last_deadline_bank/10;
-  return 0;
-}
-
-function teamShort(bootstrap, id){ return bootstrap?.teams?.find(t=>t.id===id)?.short_name || "?"; }
-function posName(t){ return ({1:"GK",2:"DEF",3:"MID",4:"FWD"})[t]||"?"; }
-function fdrFor(f, teamId){ const home=f.team_h===teamId; return home?(f.team_h_difficulty??f.difficulty??3):(f.team_a_difficulty??f.difficulty??3); }
-
-function scoreElNext(el, fixtures, gw){
-  const games = fixtures.filter(f=>f.event===gw && (f.team_h===el.team||f.team_a===el.team));
-  if (!games.length) return 0;
-  const min = Math.max(0, Math.min(1, Number(el.chance_of_playing_next_round ?? 100)/100));
-  const form = Math.min(parseFloat(el.form||"0")||0, 10);
-  const damp=[1.0,0.9,0.8];
-  let s=0;
-  for (let i=0;i<games.length;i++){
-    const mult = 1.30 - 0.10 * Math.max(2, Math.min(5, fdrFor(games[i], el.team)));
-    const ppg = parseFloat(el.points_per_game||"0")||0;
-    s += (ppg * mult * min) * (1 + 0.02*form) * (damp[i]||0.75);
-  }
-  return s;
-}
-
-function bestXIForNextGW(hypoIds, bootstrap, fixtures, gw){
-  const byId = Object.fromEntries((bootstrap?.elements||[]).map(e=>[e.id,e]));
-  const rows = hypoIds.map(id => byId[id]).filter(Boolean).map(el => ({
-    id: el.id,
-    type: el.element_type,
-    pos: posName(el.element_type),
-    team: teamShort(bootstrap, el.team),
-    name: el.web_name,      // short display name
-    score: scoreElNext(el, fixtures, gw),
-    minPct: Number(el.chance_of_playing_next_round ?? 100)
-  }));
-
+  const rows = squadEls.map(el => rowForGw(el, fixtures, gw, cfg, bootstrap));
   const gks  = rows.filter(r=>r.type===1).sort((a,b)=>b.score-a.score);
   const defs = rows.filter(r=>r.type===2).sort((a,b)=>b.score-a.score);
   const mids = rows.filter(r=>r.type===3).sort((a,b)=>b.score-a.score);
   const fwds = rows.filter(r=>r.type===4).sort((a,b)=>b.score-a.score);
 
+  // allowed shapes
   const shapes = [[3,4,3],[3,5,2],[4,4,2],[4,3,3],[4,5,1],[5,3,2],[5,4,1]];
-  const MIN = 80; // minutes threshold
+
+  const pickGK = () => {
+    const safe = gks.filter(r=>r.mp>=minPct && r.hasFixture);
+    if (safe.length) return safe[0];
+    return gks.find(r=>r.hasFixture) || null;
+  };
+  const pickN = (arr,n) => {
+    const safe = arr.filter(r=>r.mp>=minPct && r.hasFixture).slice(0,n);
+    if (safe.length===n) return { chosen:safe, relaxed:false };
+    const need = n - safe.length;
+    const fill = arr.filter(r=>r.hasFixture && !safe.find(x=>x.id===r.id)).slice(0,need);
+    return { chosen:[...safe,...fill], relaxed: need>0 };
+  };
 
   let best=null;
   for (const [d,m,f] of shapes){
-    const pickGK = () => gks.find(r=>r.minPct>=MIN) || gks[0] || null;
-    const pickN = (arr,n)=>{
-      const safe=arr.filter(r=>r.minPct>=MIN).slice(0,n);
-      if(safe.length===n) return {chosen:safe,relaxed:false};
-      const need=n-safe.length;
-      const fill=arr.filter(x=>!safe.includes(x)).slice(0,need);
-      return {chosen:[...safe,...fill],relaxed:need>0};
-    };
-
-    const GK = pickGK(); if (!GK) continue;
-    const {chosen:D,relaxed:rD}=pickN(defs,d);
-    const {chosen:M,relaxed:rM}=pickN(mids,m);
-    const {chosen:F,relaxed:rF}=pickN(fwds,f);
+    const gk = pickGK(); if (!gk) continue;
+    const {chosen: D, relaxed:rD} = pickN(defs, d);
+    const {chosen: M, relaxed:rM} = pickN(mids, m);
+    const {chosen: F, relaxed:rF} = pickN(fwds, f);
     if (D.length<d || M.length<m || F.length<f) continue;
-
-    const xi = [GK, ...D, ...M, ...F];
+    const xi=[gk, ...D, ...M, ...F];
     const total = xi.reduce((s,r)=>s+r.score,0);
 
-    // Bench line
-    const rest = rows.filter(r=>!xi.find(x=>x.id===r.id));
-    const outfield = rest.filter(r=>r.type!==1).sort((a,b)=>b.score-a.score);
-    const gk2 = rest.find(r=>r.type===1) || null;
+    const benchPool = rows.filter(r=>!xi.find(x=>x.id===r.id));
+    const benchOut  = benchPool.sort((a,b)=>b.score-a.score).slice(0,3);
+    const benchGK   = gks.find(r=>r.id!==gk.id);
+
     const benchLine = [
-      outfield[0] ? `1) ${outfield[0].name} (${outfield[0].pos})` : null,
-      outfield[1] ? `2) ${outfield[1].name} (${outfield[1].pos})` : null,
-      outfield[2] ? `3) ${outfield[2].name} (${outfield[2].pos})` : null,
-      gk2 ? `GK) ${gk2.name}` : null
+      benchOut[0] ? `1) ${benchOut[0].name} (${benchOut[0].pos})` : null,
+      benchOut[1] ? `2) ${benchOut[1].name} (${benchOut[1].pos})` : null,
+      benchOut[2] ? `3) ${benchOut[2].name} (${benchOut[2].pos})` : null,
+      benchGK     ? `GK: ${benchGK.name}` : null
     ].filter(Boolean).join(", ");
 
-    const relaxed = rD || rM || rF;
-    const cand = { d,m,f, xi, total, benchLine, relaxed, shape: `${d}-${m}-${f}` };
+    const riskyXI = xi.filter(r => r.mp < minPct || !r.hasFixture).map(r=>r.name);
+    const cand = {
+      d, m, f, xi, total,
+      benchLine,
+      gwShape:`${d}-${m}-${f}`,
+      riskyXI,
+      relaxed:(rD||rM||rF)
+    };
     if (!best || total>best.total) best=cand;
   }
   return best;
+}
+
+function rowForGw(el, fixtures, gw, cfg, bootstrap){
+  const minProb = chance(el);
+  const teamId = el.team;
+  const teamShort = (bootstrap?.teams?.find(t=>t.id===teamId)?.short_name) || "?";
+
+  const fs = fixtures
+    .filter(f => f.event === gw && (f.team_h===teamId || f.team_a===teamId))
+    .sort((a,b)=>((a.kickoff_time||"")<(b.kickoff_time||""))?-1:1);
+
+  if (!fs.length) {
+    return {
+      id: el.id, type: el.element_type, pos: posName(el.element_type),
+      team: teamShort, name: playerShort(el), mp: minProb, score: 0, hasFixture: false, double: 0
+    };
+  }
+
+  const ppg = parseFloat(el.points_per_game || "0") || 0;
+  let score = 0;
+  fs.forEach((f, idx) => {
+    const home = f.team_h === teamId;
+    const fdr  = home ? (f.team_h_difficulty ?? f.difficulty ?? 3) : (f.team_a_difficulty ?? f.difficulty ?? 3);
+    const mult = fdrMult(fdr);
+    const dampK = idx === 0 ? 1.0 : (cfg.damp ?? 0.94);
+    score += ppg * (minProb/100) * mult * dampK;
+  });
+
+  return {
+    id: el.id,
+    type: el.element_type,
+    pos: posName(el.element_type),
+    team: teamShort,
+    name: playerShort(el),
+    mp: minProb,
+    score,
+    hasFixture: true,
+    double: fs.length
+  };
+}
+
+/* ================================================================
+   Captain rendering helper
+================================================================ */
+function playerLine(r, teams, isGK=false, C=null, VC=null){
+  if (!r) return "—";
+  const tag = (C && r.id===C.id) ? " (C)" : (VC && r.id===VC.id) ? " (VC)" : "";
+  const dgw = r.double>1 ? " x2" : "";
+  return `${esc(r.name)} (${r.team})${tag}${dgw}`;
+}
+
+/* ================================================================
+   Shared small utils
+================================================================ */
+function playerShort(el){
+  const first = (el?.first_name || "").trim();
+  const last  = (el?.second_name || "").trim();
+  const web   = (el?.web_name || "").trim();
+  if (first && last) {
+    const initLast = `${first[0]}. ${last}`;
+    return (web && web.length <= initLast.length) ? web : initLast;
+  }
+  return web || last || first || "—";
+}
+function chance(el){
+  const v = parseInt(el?.chance_of_playing_next_round ?? "100", 10);
+  return Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : 100;
+}
+function fdrMult(fdr){
+  const x = Math.max(2, Math.min(5, Number(fdr)||3));
+  return 1.30 - 0.10 * x;
+}
+function getNextGwId(bootstrap){
+  const ev = bootstrap?.events || [];
+  const nxt = ev.find(e => e.is_next);
+  if (nxt) return nxt.id;
+  const cur = ev.find(e => e.is_current);
+  if (cur) {
+    const i = ev.findIndex(x => x.id === cur.id);
+    return ev[i+1]?.id || cur.id;
+  }
+  const up = ev.find(e => !e.finished);
+  return up ? up.id : (ev[ev.length-1]?.id || 1);
+}
+async function getJSON(url){
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    if (!r.ok) return null;
+    return await r.json().catch(() => null);
+  } catch { return null; }
+}
+function applyMoves(idList, moves){
+  const ids = idList.slice();
+  for (const m of (moves||[])){
+    const idx = ids.indexOf(m.outId);
+    if (idx !== -1) ids.splice(idx, 1);
+    if (!ids.includes(m.inId)) ids.push(m.inId);
+  }
+  return ids;
 }

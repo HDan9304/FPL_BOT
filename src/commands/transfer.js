@@ -1,30 +1,41 @@
 // src/commands/transfer.js — AUTO MODE (Pro preset) + DGW/Blank badges + chase/pos + list vs sell
-// Usage: /transfer [chase] [pos=DEF]    (args optional; router should pass arg string if available)
+// + parity persistence for /plan (base, plans, snapshots)
+//
+// Usage: /transfer [chase] [pos=DEF|MID|FWD|GK]
+// Router should pass arg string if available.
 
 import { send } from "../utils/telegram.js";
 import { esc } from "../utils/fmt.js";
 
-const kUser   = (id) => `user:${id}:profile`;
+/* ----------------- KV keys ----------------- */
+const kUser = (id) => `user:${id}:profile`;
+const kPlan = (id) => `plan:${id}:transfers`;
+
+/* ----------------- UI helpers ----------------- */
 const B       = (s) => `<b>${esc(s)}</b>`;
-const gbp     = (n) => (n == null ? "—" : `£${Number(n).toFixed(1)}`);
+const gbp     = (n) => (n == null ? "—" : `£${Number(n).toFixed(1)}m`);
 const posName = (t) => ({1:"GK",2:"DEF",3:"MID",4:"FWD"})[t] || "?";
 const posCodeToType = (s) => ({GK:1,GKP:1,DEF:2,DEFENDER:2,MID:3,MIDF:3,MF:3,FWD:4,FW:4,FORWARD:4}[String(s||"").toUpperCase()]||null);
 
-// Noise guards
-const MIN_DELTA_SINGLE = 0.5;  // ignore micro “upgrades”
-const MIN_DELTA_COMBO  = 1.5;  // total raw gain required before hits
-// Scan sizes
+/* ----------------- Noise guards & scan sizes ----------------- */
+const MIN_DELTA_SINGLE = 0.5;   // ignore micro “upgrades”
+const MIN_DELTA_COMBO  = 1.5;   // require this raw gain before hits
 const MAX_POOL_PER_POS = 500;
 const MAX_SINGLE_SCAN  = 500;
 
+/* =================================================================== */
+/* Public entry                                                        */
+/* =================================================================== */
 export default async function transfer(env, chatId, arg = "") {
-  const pRaw = env.FPL_BOT_KV ? await env.FPL_BOT_KV.get(kUser(chatId)) : null;
+  // 1) Linked team
+  const pRaw   = env.FPL_BOT_KV ? await env.FPL_BOT_KV.get(kUser(chatId)) : null;
   const teamId = pRaw ? (JSON.parse(pRaw).teamId) : null;
   if (!teamId) {
-    await send(env, chatId, `${B("Not linked")} Use /link <TeamID> first.\nExample: /link 1234567`, "HTML");
+    await send(env, chatId, `${B("Not linked")} Use /link &lt;TeamID&gt; first.\nExample: /link 1234567`, "HTML");
     return;
   }
 
+  // 2) Fetch core data
   const [bootstrap, fixtures, entry] = await Promise.all([
     getJSON("https://fantasy.premierleague.com/api/bootstrap-static/"),
     getJSON("https://fantasy.premierleague.com/api/fixtures/"),
@@ -34,40 +45,38 @@ export default async function transfer(env, chatId, arg = "") {
     await send(env, chatId, "Couldn't fetch FPL data. Try again shortly.");
     return;
   }
-
   const nextGW = getNextGwId(bootstrap);
   const curGW  = getCurrentGw(bootstrap);
 
-  // Parse optional args: "chase" & "pos=DEF|MID|FWD|GK"
-  const opts = parseArgs(arg);
-  const picks  = await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`);
+  // 3) Args + picks
+  const opts  = parseArgs(arg);
+  const picks = await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`);
   if (!picks) { await send(env, chatId, "Couldn't fetch your picks (is your team private?)."); return; }
 
-  // Pro auto-tune (+ chase override)
+  // 4) Auto-tune (+ chase override)
   let cfg = autoTuneSettings({ bootstrap, fixtures, picks });
-  if (opts.chase) { cfg = { ...cfg, min: Math.min(cfg.min, 75), hit: 4 }; } // looser, more aggressive
-  const focusType = opts.posType; // if provided, constrain swaps to that position
+  if (opts.chase) { cfg = { ...cfg, min: Math.min(cfg.min, 75), hit: 4 }; }
+  const focusType = opts.posType ?? null;
 
-  // bank & roster
+  // 5) Bank & roster
   const bank =
     (typeof picks?.entry_history?.bank === "number") ? picks.entry_history.bank/10 :
     (typeof entry?.last_deadline_bank === "number") ? entry.last_deadline_bank/10 : 0;
 
-  const els   = Object.fromEntries((bootstrap?.elements || []).map(e => [e.id, e]));
-  const teams = Object.fromEntries((bootstrap?.teams || []).map(t => [t.id, t]));
-  const allPicks = (picks?.picks || []);
+  const els     = Object.fromEntries((bootstrap?.elements || []).map(e => [e.id, e]));
+  const teams   = Object.fromEntries((bootstrap?.teams || []).map(t => [t.id, t]));
+  const allPicks= (picks?.picks || []);
   const startersP   = allPicks.filter(p => (p.position || 16) <= 11);
   const startersEls = startersP.map(p => els[p.element]).filter(Boolean);
-  const ownedIds    = new Set(allPicks.map(p => p.element));
+  const baseIds     = allPicks.map(p => p.element);               // exact 15; used for persistence parity
+  const ownedIds    = new Set(baseIds);
 
-  // team counts (≤3)
+  // 6) Team counts & selling values
   const teamCounts = {};
   for (const p of allPicks) {
     const el = els[p.element]; if (!el) continue;
     teamCounts[el.team] = (teamCounts[el.team] || 0) + 1;
   }
-
-  // selling prices
   const sell = {};
   for (const p of allPicks) {
     const el = els[p.element];
@@ -75,13 +84,13 @@ export default async function transfer(env, chatId, arg = "") {
     sell[p.element] = (raw / 10.0) || 0;
   }
 
-  // pre-compute horizon score
+  // 7) Precompute horizon score per element
   const byRow = {};
   for (const el of (bootstrap?.elements || [])) {
     byRow[el.id] = rowForHorizon(el, fixtures, teams, nextGW, cfg.h, cfg.damp, cfg.min);
   }
 
-  // OUT candidates (weakest starters), optionally focus a position
+  // 8) OUT candidates (weakest starters; optional position focus)
   const outCands = startersEls
     .filter(el => !focusType || el.element_type === focusType)
     .map(el => ({
@@ -97,7 +106,7 @@ export default async function transfer(env, chatId, arg = "") {
     .sort((a,b)=>a.score-b.score)
     .slice(0, 11);
 
-  // Market pool by position (minutes filter), optionally focus
+  // 9) Market pool (minutes filter; optional position focus)
   const MAX_PER_TEAM = 3;
   const poolByPos = {1:[],2:[],3:[],4:[]};
   for (const el of (bootstrap?.elements || [])) {
@@ -110,13 +119,13 @@ export default async function transfer(env, chatId, arg = "") {
       team: teamShort(teams, el.team),
       teamId: el.team,
       pos: posName(el.element_type),
-      price: (el.now_cost || 0) / 10,     // LIST price (what you pay)
+      price: (el.now_cost || 0) / 10,     // LIST price you pay
       score: r.score
     });
   }
   Object.keys(poolByPos).forEach(k => { poolByPos[k].sort((a,b)=>b.score-a.score); poolByPos[k] = poolByPos[k].slice(0, MAX_POOL_PER_POS); });
 
-  // Singles with EXPLANATIONS
+  // 10) Build singles (exclude already-owned, obey bank & team limit)
   const singles = [];
   const rejections = [];
   outer:
@@ -125,10 +134,10 @@ export default async function transfer(env, chatId, arg = "") {
     for (let i=0; i<list.length && singles.length<MAX_SINGLE_SCAN; i++) {
       const IN = list[i];
 
-      if (IN.id === out.id) { rejections.push(reason("same-player", out, IN)); continue; }
-      if (ownedIds.has(IN.id)) { rejections.push(reason("already-owned", out, IN)); continue; }
+      if (IN.id === out.id)          { rejections.push(reason("same-player", out, IN)); continue; }
+      if (ownedIds.has(IN.id))       { rejections.push(reason("already-owned", out, IN)); continue; }
 
-      const priceDiff = IN.price - out.sell;     // use SELL for OUT, LIST for IN
+      const priceDiff = IN.price - out.sell;             // pay IN (list) vs OUT (sell)
       if (priceDiff > bank + 1e-9) { rejections.push(reason("bank", out, IN, { need: priceDiff - bank })); continue; }
 
       const newCountIn = (teamCounts[IN.teamId] || 0) + (IN.teamId === out.teamId ? 0 : 1);
@@ -143,9 +152,9 @@ export default async function transfer(env, chatId, arg = "") {
         outTeamId: out.teamId, inTeamId: IN.teamId,
         outTeam: out.team, inTeam: IN.team,
         pos: out.posT,
-        outSell: out.sell,           // SELL price for OUT
-        outList: out.listPrice,      // current list for OUT (info)
-        inPrice: IN.price,           // LIST price for IN
+        outSell: out.sell,           // sell price for OUT
+        outList: out.listPrice,      // info
+        inPrice: IN.price,           // list price for IN
         priceDiff, bankLeft: bank - priceDiff,
         delta,
         why: ["passed: legal, bank ok, Δ≥0.5, minutes ok"]
@@ -155,13 +164,13 @@ export default async function transfer(env, chatId, arg = "") {
   }
   singles.sort((a,b)=>b.delta-a.delta);
 
-  // DGW/Blank detector (for the next GW)
+  // 11) DGW/Blank detector
   const counts = gwFixtureCounts(fixtures, nextGW);
-  const dgwTeams = Object.keys(counts).filter(tid => counts[tid] > 1);
+  const dgwTeams   = Object.keys(counts).filter(tid => counts[tid] > 1);
   const blankTeams = Object.keys(teams).filter(tid => (counts[tid] || 0) === 0);
   const badge = badgeLine(dgwTeams.length, blankTeams.length);
 
-  // Plans A–D (with inline WHY)
+  // 12) Plans A–D (with explanations)
   const planA = mkPlanA(rejections);
   const planB = mkPlanB(singles, cfg.ft);
   const planC = bestCombo(singles.slice(0, 120), 2, teamCounts, MAX_PER_TEAM, bank, cfg.ft);
@@ -174,11 +183,34 @@ export default async function transfer(env, chatId, arg = "") {
     { key:"D", title:`Plan D — 3 transfers ${badge}`, ...planD }
   ];
 
-  // choose recommendation
+  // 13) Choose recommendation
   const filtered = plans.map(p => ({...p})).filter(p => (p.moves.length <= 1) || (p.net >= cfg.hit));
   const best = (filtered.length ? filtered : plans).slice().sort((a,b)=> (b.net - a.net) )[0];
   const recommend = best ? best.key : "A";
 
+  // 14) Persist for /plan parity (base + moves + snapshots)
+  const snaps = {};
+  if (planB.moves?.length) snaps.B = applyMoves(baseIds, planB.moves).slice(0,15);
+  if (planC.moves?.length) snaps.C = applyMoves(baseIds, planC.moves).slice(0,15);
+  if (planD.moves?.length) snaps.D = applyMoves(baseIds, planD.moves).slice(0,15);
+
+  await env.FPL_BOT_KV.put(
+    kPlan(chatId),
+    JSON.stringify({
+      gw: nextGW,
+      model: { h: cfg.h, min: cfg.min, damp: cfg.damp, ft: cfg.ft, hit: cfg.hit, chase: !!opts.chase, focusType },
+      base: baseIds,               // exact current 15 — critical for parity with /plan
+      plans: {
+        B: (planB.moves||[]).map(m => ({ outId:m.outId, inId:m.inId })),
+        C: (planC.moves||[]).map(m => ({ outId:m.outId, inId:m.inId })),
+        D: (planD.moves||[]).map(m => ({ outId:m.outId, inId:m.inId })),
+      },
+      squads: snaps,               // pre-applied 15s for /planb|c|d
+      savedAt: Date.now()
+    })
+  );
+
+  // 15) Output
   const head = [
     `${B("Team")}: ${esc(entry?.name || "—")} | ${B("GW")}: ${nextGW} — Transfer Plan (Next)`,
     `${B("Bank")}: ${esc(gbp(bank))} | ${B("FT (assumed)")}: ${cfg.ft} | ${B("Hits")}: -4 per extra move`,
@@ -186,17 +218,19 @@ export default async function transfer(env, chatId, arg = "") {
     (focusType ? ` | ${B("Focus")}: ${posName(focusType)}` : "")
   ].join("\n");
 
-  const blocks = [];
+  const planBlocks = [];
   for (const p of plans) {
     const title = p.key === recommend ? `✅ ${p.title} (recommended)` : p.title;
-    blocks.push(renderPlan(title, p, teams, nextGW, counts));
+    planBlocks.push(renderPlan(title, p, teams, nextGW, counts));
   }
 
-  const html = [head, "", ...blocks].join("\n\n");
+  const html = [head, "", ...planBlocks, "", esc("Open: /plan  ·  /planb  ·  /planc  ·  /pland  (uses same base & these moves)")].join("\n\n");
   await send(env, chatId, html, "HTML");
 }
 
-/* ---------- parse args ---------- */
+/* =================================================================== */
+/* Args, auto, planning                                                */
+/* =================================================================== */
 function parseArgs(arg){
   const a = String(arg||"").trim();
   const out = { chase:false, posType:null };
@@ -214,21 +248,19 @@ function parseArgs(arg){
   return out;
 }
 
-/* ---------- auto tuner (Pro) ---------- */
-function autoTuneSettings({ bootstrap, fixtures, picks }, base = { h:2, min:78, damp:0.94, ft:1, hit:5 }){
-  const riskyN = riskyStartersCount(picks, bootstrap, 80);
-  const usedThis = usedTransfersThisGw(picks);
-  const cfg = { ...base };
+function autoTuneSettings({ bootstrap, fixtures, picks }, base = { h:3, min:78, damp:0.94, ft:1, hit:5 }){
+  const riskyN  = riskyStartersCount(picks, bootstrap, 80);
+  const usedThis= usedTransfersThisGw(picks);
+  const cfg     = { ...base };
 
-  cfg.ft = (usedThis === 0) ? 2 : 1;           // FT assumption for next GW
-  cfg.min = (riskyN >= 2) ? 85 : 78;           // tighten if fragile
-  cfg.damp = 0.94;                              // DGW damp
-  cfg.hit = (riskyN >= 3) ? 6 : 5;             // tougher hits if fragile
+  cfg.ft  = (usedThis === 0) ? 2 : 1;   // assume 2 FTs if none used yet this GW
+  cfg.min = (riskyN >= 2) ? 85 : 78;    // tighten minutes if fragile XI
+  cfg.damp= 0.94;                       // soften extra fixtures in DGWs
+  cfg.hit = (riskyN >= 3) ? 6 : 5;      // need higher net to justify hits on fragile teams
 
   return cfg;
 }
 
-/* ---------- planning helpers ---------- */
 function mkPlanA(rejections){
   const why = [];
   if (Array.isArray(rejections) && rejections.length) {
@@ -253,9 +285,7 @@ function mkPlanB(singles, ft){
   const s = singles[0];
   const hit = Math.max(0, 1 - ft) * 4;
   const raw = s.delta;
-  if (raw < MIN_DELTA_SINGLE) {
-    return { ...mkPlanA(), why: ["Best single was below +0.5."] };
-  }
+  if (raw < MIN_DELTA_SINGLE) return { ...mkPlanA(), why: ["Best single was below +0.5."] };
   const why = [...(s.why||[])];
   if (hit>0) why.push(`-4 applied (1 FT used already)`);
   return { moves:[s], delta: raw, hit, net: raw - hit, why };
@@ -278,7 +308,7 @@ function bestCombo(singles, K, teamCounts, MAX_PER_TEAM, bank, ft){
         counts[m.outTeamId] = (counts[m.outTeamId]||0) - 1;
         counts[m.inTeamId]  = (counts[m.inTeamId] ||0) + 1;
       }
-      spend += m.priceDiff;
+      spend    += m.priceDiff;
       deltaSum += m.delta;
       if (m.why) why.push(...m.why);
     }
@@ -294,7 +324,6 @@ function bestCombo(singles, K, teamCounts, MAX_PER_TEAM, bank, ft){
   const base = singles.slice(0, S);
   let best = null;
 
-  const idxs = [...Array(S).keys()];
   function* kComb(k, start=0, acc=[]){
     if (k===0) { yield acc; return; }
     for (let i=start;i<=S-k;i++) yield* kComb(k-1, i+1, [...acc, i]);
@@ -322,7 +351,6 @@ function renderPlan(title, plan, teams, nextGW, counts){
       const outTag = fixtureBadgeForTeam(m.outTeamId, nextGW, counts);
       lines.push(`• ${i+1}) OUT: ${esc(m.outName)} (${esc(m.outTeam)}) ${outTag} → IN: ${esc(m.inName)} (${esc(m.inTeam)}) ${inTag}`);
       lines.push(`   ΔScore: +${m.delta.toFixed(2)} | Price: ${m.priceDiff>=0?"+":""}${gbp(m.priceDiff)} | Bank left: ${gbp(m.bankLeft)}`);
-      // NEW: show list vs sell price
       lines.push(`   Prices: OUT sell ${gbp(m.outSell)} | IN list ${gbp(m.inPrice)}`);
     });
     lines.push(`Net (after hits): ${(plan.net>=0?"+":"")}${plan.net.toFixed(2)}  |  Raw Δ: +${plan.delta.toFixed(2)}  |  Hits: -${plan.hit}`);
@@ -334,7 +362,9 @@ function renderPlan(title, plan, teams, nextGW, counts){
   return lines.join("\n");
 }
 
-/* ---------- DGW/Blank helpers ---------- */
+/* =================================================================== */
+/* DGW/Blank + reasons + scoring                                       */
+/* =================================================================== */
 function gwFixtureCounts(fixtures, gw){
   const map = {};
   for (const f of (fixtures||[])) {
@@ -346,8 +376,8 @@ function gwFixtureCounts(fixtures, gw){
 }
 function badgeLine(dgwCount, blankCount){
   const parts = [];
-  if (dgwCount>0) parts.push(`[DGW:${dgwCount}]`);
-  if (blankCount>0) parts.push(`[BLANK:${blankCount}]`);
+  if (dgwCount>0)  parts.push(`[DGW:${dgwCount}]`);
+  if (blankCount>0)parts.push(`[BLANK:${blankCount}]`);
   return parts.length ? `• ${parts.join(" ")}` : "";
 }
 function fixtureBadgeForTeam(teamId, gw, counts){
@@ -357,7 +387,6 @@ function fixtureBadgeForTeam(teamId, gw, counts){
   return "";
 }
 
-/* ---------- reasons helpers ---------- */
 function reason(code, OUT, IN, extra={}){
   const m = {
     "same-player":   `Candidate equals OUT player`,
@@ -380,7 +409,6 @@ function humanReasonSummary(code, n){
 }
 function uniq(arr){ return Array.from(new Set(arr)); }
 
-/* ---------- scoring over horizon ---------- */
 function rowForHorizon(el, fixtures, teams, startGw, H = 1, damp = 0.94, minCut = 78){
   const minProb = chance(el); if (minProb < minCut) return { score: 0 };
   const ppg = parseFloat(el.points_per_game || "0") || 0;
@@ -392,7 +420,7 @@ function rowForHorizon(el, fixtures, teams, startGw, H = 1, damp = 0.94, minCut 
     if (!fs.length) continue;
     fs.forEach((f, idx) => {
       const home = f.team_h === el.team;
-      const fdr = home ? (f.team_h_difficulty ?? f.difficulty ?? 3) : (f.team_a_difficulty ?? f.difficulty ?? 3);
+      const fdr  = home ? (f.team_h_difficulty ?? f.difficulty ?? 3) : (f.team_a_difficulty ?? f.difficulty ?? 3);
       const mult = fdrMult(fdr);
       const dampK = idx === 0 ? 1.0 : damp;
       score += ppg * (minProb/100) * mult * dampK;
@@ -405,7 +433,9 @@ function fdrMult(fdr){
   return 1.30 - 0.10 * x; // easy → ~1.10, hard → ~0.80
 }
 
-/* ---------- team state signals ---------- */
+/* =================================================================== */
+/* Team state + misc                                                   */
+/* =================================================================== */
 function riskyStartersCount(picks, bootstrap, minCut=80){
   const byId = Object.fromEntries((bootstrap?.elements||[]).map(e=>[e.id,e]));
   const xi = (picks?.picks||[]).filter(p => (p.position||16) <= 11);
@@ -421,8 +451,6 @@ function usedTransfersThisGw(picks){
   const eh = picks?.entry_history;
   return (typeof eh?.event_transfers === "number") ? eh.event_transfers : null;
 }
-
-/* ---------- misc utils ---------- */
 function chance(el){
   const v = parseInt(el?.chance_of_playing_next_round ?? "100", 10);
   return Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : 100;
@@ -463,4 +491,17 @@ async function getJSON(url){
     if (!r.ok) return null;
     return await r.json().catch(() => null);
   } catch { return null; }
+}
+
+/* =================================================================== */
+/* Combo application for snapshots                                     */
+/* =================================================================== */
+function applyMoves(idList, moves){
+  const ids = idList.slice();
+  for (const m of (moves||[])){
+    const idx = ids.indexOf(m.outId);
+    if (idx !== -1) ids.splice(idx, 1);
+    if (!ids.includes(m.inId)) ids.push(m.inId);
+  }
+  return ids;
 }
