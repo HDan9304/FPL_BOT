@@ -1,13 +1,16 @@
-// index.js — Cloudflare Worker entry
-import startCmd   from "./src/commands/start.js";
-import planCmd    from "./src/commands/plan.js";
-import transferCmd from "./src/commands/transfer.js";   // <-- added
-import linkCmd    from "./src/commands/link.js";
-import unlinkCmd  from "./src/commands/unlink.js";
+// src/index.js — Cloudflare Worker entry (static imports)
+import startCmd     from "./commands/start.js";
+import planCmd      from "./commands/plan.js";
+import transferCmd  from "./commands/transfer.js";
+import linkCmd      from "./commands/link.js";
+import unlinkCmd    from "./commands/unlink.js";
+
+const text = (s, status = 200) =>
+  new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 
 export default {
   async fetch(req, env) {
-    const url = new URL(req.url);
+    const url  = new URL(req.url);
     const path = url.pathname.replace(/\/$/, "");
 
     // Health
@@ -38,12 +41,11 @@ export default {
 
       let update;
       try { update = await req.json(); } catch { return text("Bad Request", 400); }
-
       const msg = update?.message;
       if (!msg) return text("ok");
 
       const chatId = msg?.chat?.id;
-      const txt = (msg?.text || "").trim();
+      const txt    = (msg?.text || "").trim();
       if (!chatId || !txt) return text("ok");
 
       const [raw] = txt.split(/\s+/);
@@ -51,9 +53,7 @@ export default {
 
       if (cmd === "/start")    { await startCmd(env, chatId, msg.from); return text("ok"); }
       if (cmd === "/plan")     { await planCmd(env, chatId);            return text("ok"); }
-      if (cmd === "/transfer") { await transferCmd(env, chatId);        return text("ok"); } // <-- added
-
-      // If you already have these:
+      if (cmd === "/transfer") { await transferCmd(env, chatId);        return text("ok"); }
       if (cmd === "/link")     { await linkCmd(env, chatId, msg);       return text("ok"); }
       if (cmd === "/unlink")   { await unlinkCmd(env, chatId);          return text("ok"); }
 
@@ -65,6 +65,3 @@ export default {
     return text("Not Found", 404);
   }
 };
-
-const text = (s, status = 200) =>
-  new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
