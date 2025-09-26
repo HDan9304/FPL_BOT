@@ -1,11 +1,14 @@
-// worker.js — minimal bot with /start and /deadline
+// worker.js — minimal bot with deadline reminders
 // Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET
+// KV binding: FPL_BOT_KV (stores reminder flags)
+
+const REMINDER_WINDOWS = [24, 2]; // hours before deadline
+const TOLERANCE_HOURS = 0.2; // ~12 min tolerance
 
 export default {
   async fetch(req, env) {
     const url = new URL(req.url), path = url.pathname.replace(/\/$/, "");
 
-    // Health
     if (req.method==="GET" && (path===""||path==="/")) return text("OK");
 
     // Register webhook
@@ -24,7 +27,7 @@ export default {
       return text(j?.ok?"webhook set":`failed: ${j?.description||"unknown"}`, j?.ok?200:500);
     }
 
-    // Webhook
+    // Telegram webhook
     if (path==="/webhook/telegram") {
       if (req.method!=="POST") return text("Method Not Allowed",405);
       if (req.headers.get("x-telegram-bot-api-secret-token")!==env.TELEGRAM_WEBHOOK_SECRET) return text("Forbidden",403);
@@ -42,48 +45,94 @@ export default {
     }
 
     return text("Not Found",404);
+  },
+
+  // Cloudflare Cron trigger will call this
+  async scheduled(event, env, ctx) {
+    await runDeadlineSweep(env);
   }
 };
 
-/* ---------- handlers ---------- */
+/* -------- Handlers -------- */
 async function handleStart(env, chatId, from) {
   const first = ascii((from?.first_name || "there").trim());
-  const msg = `Hey ${first}!\n\nAvailable commands:\n/start — show this message\n/deadline — show next GW deadline`;
+  const msg = `Hey ${first}!\n\nCommands:\n/start — show this message\n/deadline — show next GW deadline\n\nI will also remind you 24h and 2h before the next deadline.`;
   await send(env, chatId, msg);
 }
 
 async function handleDeadline(env, chatId) {
-  try {
-    const data = await fetch("https://fantasy.premierleague.com/api/bootstrap-static/").then(r=>r.json());
-    const ev = (data?.events||[]).find(e=>e.is_next);
-    if (!ev?.deadline_time) { await send(env, chatId, "Couldn’t find next deadline."); return; }
-    const dl = new Date(ev.deadline_time);
-    const now = Date.now();
-    const ms = dl - now;
-    const d = Math.floor(ms/86400000);
-    const h = Math.floor((ms%86400000)/3600000);
-    const m = Math.floor((ms%3600000)/60000);
+  const ev = await nextEvent();
+  if (!ev) { await send(env, chatId, "Couldn’t fetch next deadline."); return; }
 
-    const line = [
-      `GW${ev.id} Deadline`,
-      `UTC: ${dl.getUTCFullYear()}-${pad(dl.getUTCMonth()+1)}-${pad(dl.getUTCDate())} ${pad(dl.getUTCHours())}:${pad(dl.getUTCMinutes())}`,
-      `Countdown: ${d}d ${h}h ${m}m`
-    ].join("\n");
+  const dl = new Date(ev.deadline_time);
+  const ms = dl - Date.now();
+  const d = Math.floor(ms/86400000);
+  const h = Math.floor((ms%86400000)/3600000);
+  const m = Math.floor((ms%3600000)/60000);
 
-    await send(env, chatId, line);
-  } catch {
-    await send(env, chatId, "Error fetching deadline.");
+  const msg = [
+    `GW${ev.id} Deadline`,
+    `UTC: ${dl.getUTCFullYear()}-${pad(dl.getUTCMonth()+1)}-${pad(dl.getUTCDate())} ${pad(dl.getUTCHours())}:${pad(dl.getUTCMinutes())}`,
+    `Countdown: ${d}d ${h}h ${m}m`
+  ].join("\n");
+
+  await send(env, chatId, msg);
+}
+
+/* -------- Deadline reminders -------- */
+async function runDeadlineSweep(env) {
+  const ev = await nextEvent();
+  if (!ev) return;
+  const deadline = new Date(ev.deadline_time);
+  const hoursTo = (deadline - Date.now()) / 36e5;
+
+  // For demo: only remind a fixed chatId (replace with your ID, or extend to all users later)
+  const chatId = env.DEFAULT_CHAT_ID; // set in wrangler.toml secrets
+
+  for (const T of REMINDER_WINDOWS) {
+    if (Math.abs(hoursTo - T) <= TOLERANCE_HOURS) {
+      const flag = `alerted:${chatId}:gw${ev.id}:${T}`;
+      if (!(await env.FPL_BOT_KV.get(flag))) {
+        await sendReminder(env, chatId, ev, deadline, T);
+        await env.FPL_BOT_KV.put(flag, "1", { expirationTtl: 60*60*48 }); // expire after 2d
+      }
+    }
   }
 }
 
-/* ---------- helpers ---------- */
-const text = (s, status=200) => new Response(s, { status, headers:{ "content-type":"text/plain; charset=utf-8" } });
+async function sendReminder(env, chatId, ev, deadline, T) {
+  const ms = deadline - Date.now();
+  const h = Math.max(0, Math.floor(ms/36e5));
+  const m = Math.max(0, Math.floor((ms%36e5)/6e4));
+
+  const msg = [
+    `⏰ GW${ev.id} deadline reminder`,
+    `UTC: ${deadline.toISOString().slice(0,16).replace("T"," ")}`,
+    "",
+    `Countdown: ${h}h ${m}m`,
+    "Advice: Make transfers ~2–6h before deadline (team news, price moves)."
+  ].join("\n");
+
+  await send(env, chatId, msg);
+}
+
+/* -------- Helpers -------- */
+async function nextEvent() {
+  try {
+    const r = await fetch("https://fantasy.premierleague.com/api/bootstrap-static/");
+    const j = await r.json();
+    return (j.events||[]).find(e=>e.is_next);
+  } catch { return null; }
+}
+
+const text = (s, status=200)=>new Response(s,{status,headers:{"content-type":"text/plain; charset=utf-8"}});
 const parseCmd = (t)=>{ if(!t.startsWith("/")) return {name:"",args:[]}; const parts=t.split(/\s+/); return {name:parts[0].slice(1).toLowerCase(), args:parts.slice(1)}; };
 const pad = (n)=>String(n).padStart(2,"0");
-const ascii = (s)=>String(s).replace(/[‘’]/g,"'").replace(/[“”]/g,'"').replace(/\u2014|\u2013/g,"-").replace(/\u00A0/g," ");
+const ascii = (s)=>String(s).replace(/[‘’]/g,"'").replace(/[“”]/g,'"');
 async function send(env, chat_id, message) {
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method:"POST", headers:{ "content-type":"application/json; charset=utf-8" },
+    method:"POST",
+    headers:{ "content-type":"application/json; charset=utf-8" },
     body: JSON.stringify({ chat_id, text: message, disable_web_page_preview:true })
   }).catch(()=>{});
 }
