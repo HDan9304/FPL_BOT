@@ -1,4 +1,4 @@
-// worker.js (ultra-compact + /transfer with base squad, FT logic, ITB, selling prices)
+// worker.js (ultra-compact, with /transfer planner + selling price + suggestion)
 export default{async fetch(req,env){const u=new URL(req.url),p=u.pathname.replace(/\/$/,"");if(req.method==="GET"&&(p===""||p==="/"))return x("OK");if(req.method==="GET"&&p==="/init-webhook"){const r=await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`,{method:"POST",headers:{"content-type":"application/json; charset=utf-8"},body:JSON.stringify({url:`${u.origin}/webhook/telegram`,secret_token:env.TELEGRAM_WEBHOOK_SECRET,allowed_updates:["message"],drop_pending_updates:true})});const j=await r.json().catch(()=>({}));return x(j?.ok?"webhook set":`failed: ${j?.description||"unknown"}`,j?.ok?200:500)}if(p==="/webhook/telegram"){if(req.method!=="POST")return x("Method Not Allowed",405);if(req.headers.get("x-telegram-bot-api-secret-token")!==env.TELEGRAM_WEBHOOK_SECRET)return x("Forbidden",403);let up;try{up=await req.json()}catch{return x("Bad Request",400)}const m=up?.message,cid=m?.chat?.id,t=(m?.text||"").trim();if(!cid)return x("ok");await env.FPL_BOT_KV.put(K.last(cid),String(Date.now()));const c=cmd(t);switch(c.name){case"start":await handleStart(env,m);break;case"linkteam":await handleLinkTeam(env,m,c.args);break;case"myteam":await handleMyTeam(env,m);break;case"transfer":await handleTransfer(env,m);break;default:break}return x("ok")}return x("Not Found",404)}};
 const x=(s,st=200)=>new Response(s,{status:st,headers:{"content-type":"text/plain; charset=utf-8"}});
 
@@ -21,55 +21,47 @@ async function handleTransfer(env,m){
   const next=ev.find(e=>e.is_next)||((cur&&ev.find(e=>e.id===cur.id+1))||null);
   const curId=cur?.id, nextId=next?.id||(curId?curId+1:null);
   const dlRaw=next?.deadline_time||null, dlMs=dlRaw?new Date(dlRaw).getTime():null, beforeDL=dlMs?Date.now()<dlMs:false;
-
   if(!curId||!nextId) return sendHTML(env,id,`${B("Oops")} ${esc("Can't resolve next gameweek yet.")}`,keys());
 
-  // Fetch picks: base squad = current XI unless Free Hit active, then revert to previous GW squad
   const curPicks=await fplEntryPicks(tid,curId);
   const prevPicks=(curId>1)?await fplEntryPicks(tid,curId-1):null;
   const activeChip=curPicks?.active_chip||null;
   const base = (activeChip==="freehit" && prevPicks?.picks?.length) ? prevPicks : curPicks;
 
-  // Bank (ITB) = current ITB (from current picks entry_history.bank)
   const bank = curPicks?.entry_history?.bank ?? 0; // tenths
-
-  // FTs for next GW: if used 0 this GW AND we are before current deadline => 2 (cap 2), else 1
   const usedThisGW = curPicks?.entry_history?.event_transfers ?? 0;
   const ftNext = (beforeDL && usedThisGW===0) ? 2 : 1;
 
-  // Selling prices from base picks (selling, not list). purchase/selling are in tenths.
-  const baseP = (base?.picks||[]).slice().sort((a,b)=>a.position-b.position);
+  const baseP=(base?.picks||[]).slice().sort((a,b)=>a.position-b.position);
   const group={GK:[],DEF:[],MID:[],FWD:[]};
   for(const p of baseP){
     const e=elMap.get(p.element); if(!e) continue;
-    const line = `${esc(e.web_name)} ${esc(`(${abbr(e.team)}, ${pos(e.element_type)})`)} ${esc(`£${(p.selling_price/10).toFixed(1)} sell`)}`;
-    if(e.element_type===1) group.GK.push(line);
-    else if(e.element_type===2) group.DEF.push(line);
-    else if(e.element_type===3) group.MID.push(line);
-    else group.FWD.push(line);
-  }
+    const sp=sellPrice(p,e); // tenths
+    const line=`${esc(e.web_name)} ${esc(`(${abbr(e.team)}, ${pos(e.element_type)})`)} ${esc(`£${(sp/10).toFixed(1)} sell`)}`;
+    if(e.element_type===1)group.GK.push(line); else if(e.element_type===2)group.DEF.push(line); else if(e.element_type===3)group.MID.push(line); else group.FWD.push(line;
+  )}
 
   const fmtUTC=d=>{const z=n=>String(n).padStart(2,"0");return `${d.getUTCFullYear()}-${z(d.getUTCMonth()+1)}-${z(d.getUTCDate())} ${z(d.getUTCHours())}:${z(d.getUTCMinutes())} UTC`};
   const countdown=ms=>{if(ms<=0)return "deadline passed";const d=Math.floor(ms/864e5),h=Math.floor(ms%864e5/36e5),m=Math.floor(ms%36e5/6e4);return `${d}d ${h}h ${m}m`};
-  const dlStr=dlRaw?fmtUTC(new Date(dlRaw)):"—", leftStr=dlMs!=null?countdown(dlMs-Date.now()):"—";
+  const dlStr=dlRaw?fmtUTC(new Date(dlRaw)):"—", leftMs=dlMs!=null?dlMs-Date.now():null, leftStr=leftMs!=null?countdown(leftMs):"—";
 
-  const reasonFT = (ftNext===2) ? "0 transfers used this GW + before deadline → rollover to 2 FTs." : "Standard 1 FT for next GW.";
-  const fhNote = (activeChip==="freehit") ? "Free Hit active this GW → base squad reverts to last GW picks." : "";
+  const reasonFT=(ftNext===2)?"0 transfers used this GW + before deadline → rollover to 2 FTs.":"Standard 1 FT for next GW.";
+  const fhNote=(activeChip==="freehit")?"Free Hit active this GW → base squad reverts to last GW picks.":"";
+  const tip = leftMs==null ? "When prices are volatile, act after pressers; otherwise 12–24h before deadline."
+           : leftMs>72*36e5 ? "Plenty of time: wait for press conferences and injuries, move ~12–24h before deadline."
+           : leftMs>6*36e5  ? "Hold until key team news; consider moving ~2–6h before deadline."
+           : leftMs>0       ? "Tight window: finalize moves now to avoid a last-minute rush."
+           :                  "Deadline passed—plan for the following GW.";
 
-  const head = `<b>${esc("Transfers (Planner)")}</b>`;
-  const top  = [ `${B("Target GW")} ${esc(String(nextId))}`, `${B("Deadline (UTC)")} ${esc(dlStr)}`, `${B("Countdown")} ${esc(leftStr)}` ].join("\n");
-  const ft   = [ `${B("Free Transfers (next)") } ${esc(String(ftNext))}`, `  ${esc(reasonFT)}` ].join("\n");
-  const itb  = `${B("Bank (ITB)")} ${esc(`£${(bank/10).toFixed(1)}`)}`;
-  const baseTitle = `${B("Base Squad")} ${esc("(selling prices)")}`;
-  const baseBlock = [
-    section("GK",group.GK),
-    section("DEF",group.DEF),
-    section("MID",group.MID),
-    section("FWD",group.FWD)
-  ].filter(Boolean).join("\n");
-  const html = [ head, "", top, "", ft, itb, fhNote?`\n${esc(fhNote)}`:"", "", baseTitle, baseBlock ].filter(Boolean).join("\n");
-
-  await sendHTML(env,id,html,keys());
+  const head=`<b>${esc("Transfers (Planner)")}</b>`;
+  const top=[`${B("Target GW")} ${esc(String(nextId))}`,`${B("Deadline (UTC)")} ${esc(dlStr)}`,`${B("Countdown")} ${esc(leftStr)}`].join("\n");
+  const ft=[`${B("Free Transfers (next)")} ${esc(String(ftNext))}`,`  ${esc(reasonFT)}`].join("\n");
+  const itb=`${B("Bank (ITB)")} ${esc(`£${(bank/10).toFixed(1)}`)}`;
+  const sugg=`${B("Suggestion")} ${esc(tip)}`;
+  const baseTitle=`${B("Base Squad")} ${esc("(selling prices)")}`;
+  const baseBlock=[section("GK",group.GK),section("DEF",group.DEF),section("MID",group.MID),section("FWD",group.FWD)].filter(Boolean).join("\n");
+  const html=[head,"",top,"",ft,itb,fhNote?`\n${esc(fhNote)}`:"",sugg,"",baseTitle,baseBlock].filter(Boolean).join("\n");
+  await sendHTML(env,id,html,keys())
 }
 
 /* ---------- Telegram ---------- */
@@ -88,6 +80,10 @@ const fplEventLive=async(gw)=>{try{const r=await fetch(`https://fantasy.premierl
 const cmd=t=>!t.startsWith("/")?{name:"",args:[]}:{name:t.split(/\s+/)[0].slice(1).toLowerCase(),args:t.split(/\s+/).slice(1)};
 const remainingChips=played=>{const c={wildcard:0,freehit:0,bench_boost:0,triple_captain:0};for(const n of played)if(n in c)c[n]++;const out=[],wc=Math.max(0,2-c.wildcard);if(wc>0)out.push("Wildcard");if(c.freehit===0)out.push("Free Hit");if(c.bench_boost===0)out.push("Bench Boost");if(c.triple_captain===0)out.push("Triple Captain");return out};
 const niceChip=n=>({freehit:"Free Hit",bench_boost:"Bench Boost",triple_captain:"Triple Captain",wildcard:"Wildcard"}[n]||n);
+// safe selling price: prefer API selling_price; else buy + floor((now-buy)/2); fallback to now or buy; default 0 (all tenths)
+const sellPrice=(p,e)=>Number.isFinite(p?.selling_price)?p.selling_price:
+  (Number.isFinite(p?.purchase_price)&&Number.isFinite(e?.now_cost)?(p.purchase_price+Math.floor(Math.max(0,e.now_cost-p.purchase_price)/2)):
+  (Number.isFinite(e?.now_cost)?e.now_cost:Number.isFinite(p?.purchase_price)?p.purchase_price:0));
 function simulateAutosubs(XI,BN,live,el){const pos=id=>({1:"GK",2:"DEF",3:"MID",4:"FWD"}[el.get(id)?.element_type]||""),mins=id=>live.get(id)?.minutes||0,ct={GK:0,DEF:0,MID:0,FWD:0};for(const p of XI)ct[pos(p.element)]++;const zeroGK=XI.find(p=>pos(p.element)==="GK"&&mins(p.element)===0)||null,zeroOut=XI.filter(p=>pos(p.element)!=="GK"&&mins(p.element)===0),out=[],used=new Set();const bGK=BN.find(p=>pos(p.element)==="GK");if(zeroGK&&bGK&&mins(bGK.element)>0){out.push({outId:zeroGK.element,inId:bGK.element,outPos:"GK",inPos:"GK",outName:el.get(zeroGK.element)?.web_name||"",inName:el.get(bGK.element)?.web_name||""});used.add(bGK.element)}const need={DEF:3,MID:2,FWD:1},B=BN.filter(p=>pos(p.element)!=="GK");for(const bp of B){if(used.has(bp.element))continue;if(mins(bp.element)<=0)continue;const bP=pos(bp.element);for(let i=0;i<zeroOut.length;i++){const sp=zeroOut[i],sP=pos(sp.element),c={...ct};c[sP]--;c[bP]++;if(c.DEF>=need.DEF&&c.MID>=need.MID&&c.FWD>=need.FWD){ct[sP]--;ct[bP]++;out.push({outId:sp.element,inId:bp.element,outPos:sP,inPos:bP,outName:el.get(sp.element)?.web_name||"",inName:el.get(bp.element)?.web_name||""});zeroOut.splice(i,1);used.add(bp.element);break}}}return out}
 const section=(lab,lines)=>lines.length?([`${B(lab)} ${lines[0]}`,...lines.slice(1).map(s=>`  ${s}`),""].join("\n")):"";
 const ascii=s=>String(s).replace(/[‘’]/g,"'").replace(/[“”]/g,'"').replace(/\u2014|\u2013/g,"-").replace(/•/g,"-").replace(/\u00A0/g," ");
