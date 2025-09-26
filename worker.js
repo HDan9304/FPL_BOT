@@ -10,7 +10,7 @@ export default {
     // Health
     if (req.method === "GET" && (path === "" || path === "/")) return text("OK");
 
-    // Webhook init
+    // Webhook init (optional helper)
     if (req.method === "GET" && path === "/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method: "POST",
@@ -45,7 +45,7 @@ export default {
         case "start":    await handleStart(env, msg); break;
         case "linkteam": await handleLinkTeam(env, msg, cmd.args); break;
         case "myteam":   await handleMyTeam(env, msg); break;
-        default: break;
+        default: /* silent */ break;
       }
       return text("ok");
     }
@@ -212,7 +212,7 @@ async function handleMyTeam(env, msg) {
     const multNote   = mult === 0 ? " (bench)" : (mult === 1 ? "" : ` (x${mult}=${rawPts*mult})`);
     const tag        = isCap ? " (C)" : (isVC ? " (VC)" : "");
 
-    // Format: "Name (TEAM, POS) points ..."
+    // "Name (TEAM, POS) points ..."
     return `${htmlEsc(`${name}${tag}`)} ${htmlEsc(`(${club}, ${pos})`)} ${htmlEsc(String(rawPts))}${htmlEsc(bonusSuffix)}${htmlEsc(multNote)}`;
   };
 
@@ -235,54 +235,57 @@ async function handleMyTeam(env, msg) {
   const played = (history.chips || []).map(c => c.name);
   const remaining = remainingChips(played);
 
-  // Format top (important first)
+  // --- UI: compact top summary with | separators ---
   const teamName = sanitizeAscii(`${entry.name || "Team"}`);
   const fmtMoney = (v) => (typeof v === "number" ? (v/10).toFixed(1) : "-");
   const fmtNum   = (n) => (typeof n === "number" ? n.toLocaleString("en-GB") : "-");
 
-  const header = [
-    `<b>${htmlEsc(teamName)}</b>`,
-    htmlEsc(`Gameweek ${gw} (current)`)
-  ].join("\n");
+  const header = `<b>${htmlEsc(teamName)}</b>\n${htmlEsc(`Gameweek ${gw} (current)`)}`;
 
-  const overviewTop = [
-    points != null ? `${boldLabel("Points")} <b>${htmlEsc(String(points))}</b>` : "",
-    rank   != null ? `${boldLabel("Overall Rank")} ${htmlEsc(fmtNum(rank))}` : "",
-    value  != null ? `${boldLabel("Team Value")} ${htmlEsc(fmtMoney(value))}` : "",
-    bank   != null ? `${boldLabel("Bank")} ${htmlEsc(fmtMoney(bank))}` : "",
-    capEl  ? `${boldLabel("Captain")} ${htmlEsc(elById.get(capEl)?.web_name || "")}` : "",
-    vcEl   ? `${boldLabel("Vice-Captain")} ${htmlEsc(elById.get(vcEl)?.web_name || "")}` : "",
-    activeChip ? `${boldLabel("Active Chip")} ${htmlEsc(prettyChip(activeChip))}` : `${boldLabel("Active Chip")} ${htmlEsc("None")}`
-  ].filter(Boolean).join("\n");
+  const summaryLine1 = joinWithPipes([
+    boldFirst("Points", points != null ? String(points) : "-"),
+    boldFirst("Overall Rank", rank != null ? fmtNum(rank) : "-"),
+    boldFirst("Team Value", fmtMoney(value)),
+    boldFirst("Bank", fmtMoney(bank))
+  ]);
 
-  // Position sections exactly like your example
-  const section = (label, lines) => {
-    if (!lines.length) return "";
-    return `${boldLabel(label)} ${lines[0]}\n${lines.slice(1).map(s => s).join("\n")}`;
-  };
+  const summaryLine2 = joinWithPipes([
+    boldFirst("Captain", capEl ? (elById.get(capEl)?.web_name || "") : "—"),
+    boldFirst("Vice-Captain", vcEl ? (elById.get(vcEl)?.web_name || "") : "—"),
+    boldFirst("Active Chip", activeChip ? prettyChip(activeChip) : "None")
+  ]);
+
+  // Position sections (spaced)
+  const sectionBlock = (label, lines) =>
+    lines.length ? [`${boldLabel(label)}`, lines.join("\n")].join("\n") : "";
 
   const startersBlock = [
-    section("GK",  group.GK),
+    sectionBlock("GK",  group.GK),
     ``,
-    section("DEF", group.DEF),
+    sectionBlock("DEF", group.DEF),
     ``,
-    section("MID", group.MID),
+    sectionBlock("MID", group.MID),
     ``,
-    section("FWD", group.FWD)
-  ].join("\n");
+    sectionBlock("FWD", group.FWD)
+  ].filter(Boolean).join("\n");
+
+  const benchBlock = benchLines.length
+    ? [`${boldLabel("Bench")}`, benchLines.join("\n")].join("\n")
+    : "";
 
   const chipsBottom = `${boldLabel("Available Chips")} ${htmlEsc(remaining.join(", ") || "None")}`;
 
   const html = [
     header,
     ``,
-    overviewTop,          // important info first
+    summaryLine1,
+    summaryLine2,
     ``,
-    startersBlock,        // grouped XI by positions
+    startersBlock,
     ``,
-    benchLines.length ? `${boldLabel("Bench")} ${benchLines[0]}\n${benchLines.slice(1).join("\n")}` : "",
+    benchBlock,
     ``,
-    chipsBottom           // less important at the bottom
+    chipsBottom
   ].filter(Boolean).join("\n");
 
   await sendHTML(env, chatId, html, keyboardMain());
@@ -290,7 +293,7 @@ async function handleMyTeam(env, msg) {
 
 /* ---------- Telegram (HTML) ---------- */
 
-// Reply keyboard
+// Reply keyboard (clean & minimal)
 function keyboardMain() {
   return {
     keyboard: [
@@ -413,8 +416,18 @@ function htmlEsc(s) {
 }
 function stripHtml(s) { return s.replace(/<[^>]+>/g, ""); }
 
-// Label helper: **Bold first word**
+// Label helpers
 function boldLabel(label) { return `<b>${htmlEsc(label)}:</b>`; }
+
+// "Label: value" with bolded first word, safe-escaped
+function boldFirst(label, value) {
+  return `<b>${htmlEsc(label)}:</b> ${htmlEsc(String(value))}`;
+}
+
+// Join chunks with " | "
+function joinWithPipes(parts) {
+  return parts.filter(Boolean).join(` ${htmlEsc("|")} `);
+}
 
 /* ---------- KV keys ---------- */
 const kLastSeen     = id => `chat:${id}:last_seen`;
