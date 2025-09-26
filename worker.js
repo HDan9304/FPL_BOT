@@ -40,6 +40,7 @@ export default {
       switch (cmd.name) {
         case "start":    await handleStart(env, msg); break;
         case "linkteam": await handleLinkTeam(env, msg, cmd.args); break;
+        case "myteam":   await handleMyTeam(env, msg); break;
         default: break;
       }
       return text("ok");
@@ -55,7 +56,6 @@ async function handleStart(env, msg) {
   const chatId = msg.chat.id;
   const first = sanitizeAscii((msg.from?.first_name || "there").trim());
 
-  // HTML is robust here (bold, <code>, <pre>, angle brackets etc.)
   const html = [
     `<b>${htmlEsc(`Hey ${first}!`)}</b>`,
     ``,
@@ -63,6 +63,7 @@ async function handleStart(env, msg) {
     ``,
     `${htmlEsc(`- Link your team:`)} <code>/linkteam &lt;YourTeamID&gt;</code>`,
     `${htmlEsc(`- Current gameweek:`)} <code>/gw</code>`,
+    `${htmlEsc(`- Your team (this GW):`)} <code>/myteam</code>`,
     `${htmlEsc(`- Help:`)} <code>/help</code>`
   ].join("\n");
 
@@ -82,7 +83,6 @@ async function handleLinkTeam(env, msg, args) {
       htmlEsc("2) Look at the URL: it shows /entry/1234567/ - that's your ID"),
       htmlEsc("3) Send the command like this:")
     ].join("\n");
-
     const block = `<pre><code>/linkteam 1234567</code></pre>`;
     await safeSendHTML(env, chatId, `${guide}\n${block}`);
     return;
@@ -113,11 +113,79 @@ async function handleLinkTeam(env, msg, args) {
     `${htmlEsc("Team ID:")} ${htmlEsc(String(teamId))}`,
     ``,
     htmlEsc("Next:"),
-    `${htmlEsc("- ")}<code>/gw</code> ${htmlEsc("(current gameweek)")}`,
-    `${htmlEsc("- ")}<code>/team</code> ${htmlEsc("(your team summary)")}`
+    `${htmlEsc("- ")}<code>/myteam</code> ${htmlEsc("(your team this GW)")}`,
+    `${htmlEsc("- ")}<code>/gw</code> ${htmlEsc("(current gameweek)")}`
   ].filter(Boolean).join("\n");
 
   await safeSendHTML(env, chatId, html);
+}
+
+async function handleMyTeam(env, msg) {
+  const chatId = msg.chat.id;
+  const prof = await env.FPL_BOT_KV.get(kUserProfile(chatId)).then(j => j && JSON.parse(j)).catch(() => null);
+  const teamId = prof?.teamId;
+  if (!teamId) {
+    const html = [
+      htmlEsc("You haven't linked a team yet."),
+      `${htmlEsc("Use:")} <code>/linkteam &lt;YourTeamID&gt;</code>`
+    ].join("\n");
+    await safeSendHTML(env, chatId, html);
+    return;
+  }
+
+  // 1) Load bootstrap to get CURRENT event + player names
+  const boot = await fplBootstrap();
+  if (!boot) { await safeSendHTML(env, chatId, htmlEsc("FPL is a bit busy. Try again in a moment.")); return; }
+
+  const currentEvent = (boot.events || []).find(e => e.is_current) ||
+                       (boot.events || []).filter(e => e.finished).sort((a,b)=>b.id-a.id)[0] ||
+                       null;
+  if (!currentEvent) { await safeSendHTML(env, chatId, htmlEsc("Couldn't determine the current gameweek.")); return; }
+  const gw = currentEvent.id;
+
+  // 2) Team summary + current GW history & picks
+  const [entry, history, picks] = await Promise.all([
+    fplEntry(teamId),
+    fplEntryHistory(teamId),
+    fplEntryPicks(teamId, gw)
+  ]);
+
+  if (!entry || !history) { await safeSendHTML(env, chatId, htmlEsc("Couldn't load your team right now.")); return; }
+
+  const thisGw = (history.current || []).find(r => r.event === gw);
+  const points = thisGw?.points ?? null;
+  const total  = thisGw?.total_points ?? null;
+  const rank   = thisGw?.overall_rank ?? thisGw?.rank ?? null; // some seasons use overall_rank later
+
+  // Captain name via picks + elements list
+  let captainName = null;
+  if (picks?.picks?.length) {
+    const capEl = picks.picks.find(p => p.is_captain)?.element;
+    if (capEl) {
+      const el = (boot.elements || []).find(e => e.id === capEl);
+      if (el) captainName = `${el.web_name}`;
+    }
+  }
+
+  const teamName = sanitizeAscii(`${entry.name || "Team"}`);
+  const value    = thisGw?.value ?? history?.current?.slice(-1)?.[0]?.value ?? entry?.value ?? null; // in tenths
+  const bank     = thisGw?.bank ?? history?.current?.slice(-1)?.[0]?.bank ?? entry?.bank ?? null;
+
+  const fmtMoney = (v) => (typeof v === "number" ? (v/10).toFixed(1) : "-"); // FPL stores tenths
+  const fmtNum   = (n) => (typeof n === "number" ? n.toLocaleString("en-GB") : "-");
+
+  const lines = [
+    `<b>${htmlEsc(teamName)}</b>`,
+    `${htmlEsc(`GW ${gw} (current)`)}`,
+    ``,
+    points != null ? `${htmlEsc("Points:")} <b>${htmlEsc(String(points))}</b>` : "",
+    rank   != null ? `${htmlEsc("Overall rank:")} ${htmlEsc(fmtNum(rank))}` : "",
+    value  != null ? `${htmlEsc("Team value:")} ${htmlEsc(fmtMoney(value))}` : "",
+    bank   != null ? `${htmlEsc("Bank:")} ${htmlEsc(fmtMoney(bank))}` : "",
+    captainName ? `${htmlEsc("Captain:")} ${htmlEsc(captainName)}` : ""
+  ].filter(Boolean).join("\n");
+
+  await safeSendHTML(env, chatId, lines);
 }
 
 /* ---------- HTTP ---------- */
@@ -126,30 +194,31 @@ const text = (s, status = 200) => new Response(s, { status, headers: { "content-
 /* ---------- Telegram (HTML) ---------- */
 
 async function safeSendHTML(env, chat_id, html) {
-  // Try HTML first
   const r1 = await tg(env, "sendMessage", {
-    chat_id,
-    text: html,
-    parse_mode: "HTML",
-    disable_web_page_preview: true
+    chat_id, text: html, parse_mode: "HTML", disable_web_page_preview: true
   });
   if (r1?.ok) return;
-  // Fallback: strip tags to plain text
   await tg(env, "sendMessage", { chat_id, text: stripHtml(html), disable_web_page_preview: true });
 }
 
 async function tg(env, method, payload) {
   try {
     const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
-      method: "POST",
-      headers: { "content-type": "application/json; charset=utf-8" },
-      body: JSON.stringify(payload)
+      method: "POST", headers: { "content-type": "application/json; charset=utf-8" }, body: JSON.stringify(payload)
     });
     return await r.json();
   } catch { return { ok: false }; }
 }
 
 /* ---------- FPL ---------- */
+
+async function fplBootstrap() {
+  try {
+    const r = await fetch(`https://fantasy.premierleague.com/api/bootstrap-static/`, { cf: { cacheTtl: 60 } });
+    if (!r.ok) return null;
+    return await r.json().catch(() => null);
+  } catch { return null; }
+}
 
 async function fplEntry(teamId) {
   try {
@@ -161,6 +230,22 @@ async function fplEntry(teamId) {
   } catch { return null; }
 }
 
+async function fplEntryHistory(teamId) {
+  try {
+    const r = await fetch(`https://fantasy.premierleague.com/api/entry/${teamId}/history/`, { cf: { cacheTtl: 0 } });
+    if (!r.ok) return null;
+    return await r.json().catch(() => null);
+  } catch { return null; }
+}
+
+async function fplEntryPicks(teamId, gw) {
+  try {
+    const r = await fetch(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${gw}/picks/`, { cf: { cacheTtl: 0 } });
+    if (!r.ok) return null;
+    return await r.json().catch(() => null);
+  } catch { return null; }
+}
+
 /* ---------- utils ---------- */
 
 function parseCommand(text) {
@@ -169,31 +254,22 @@ function parseCommand(text) {
   return { name: cmd.slice(1).toLowerCase(), args };
 }
 
-// Normalize smart punctuation to ASCII (prevents  replacement on some clients)
 function sanitizeAscii(s) {
   return String(s)
     .replace(/[‘’]/g, "'")
     .replace(/[“”]/g, '"')
-    .replace(/\u2014/g, "-") // em dash —
-    .replace(/\u2013/g, "-") // en dash –
+    .replace(/\u2014/g, "-")
+    .replace(/\u2013/g, "-")
     .replace(/•/g, "-")
-    .replace(/\u00A0/g, " "); // NBSP -> space
+    .replace(/\u00A0/g, " ");
 }
 
-// Escape for HTML parse_mode
 function htmlEsc(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 }
 
-// Convenience: sanitize then escape for HTML
-function htmlSafe(s) { return htmlEsc(sanitizeAscii(s)); }
-
-// Strip tags for plain-text fallback
 function stripHtml(s) { return s.replace(/<[^>]+>/g, ""); }
 
 /* ---------- KV keys ---------- */
-const kLastSeen   = id => `chat:${id}:last_seen`;
+const kLastSeen    = id => `chat:${id}:last_seen`;
 const kUserProfile = chatId => `user:${chatId}:profile`;
