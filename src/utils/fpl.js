@@ -1,3 +1,5 @@
+// FPL helpers (bootstrap, entry, picks, naming, etc.)
+
 export async function getBootstrap() {
   try {
     const r = await fetch("https://fantasy.premierleague.com/api/bootstrap-static/", {
@@ -16,7 +18,7 @@ export function getCurrentGw(bootstrap) {
   const nxt = ev.find(e => e.is_next);
   if (nxt) return nxt.id;
   const up = ev.find(e => !e.finished);
-  return up ? up.id : (ev[ev.length-1]?.id || 1);
+  return up ? up.id : (ev[ev.length - 1]?.id || 1);
 }
 
 export async function getEntry(id) {
@@ -46,13 +48,18 @@ export function teamShort(bootstrap, teamId) {
   const t = (bootstrap?.teams || []).find(x => x.id === teamId);
   return t?.short_name || "?";
 }
-export function posName(et) { return ({1:"GK",2:"DEF",3:"MID",4:"FWD"})[et] || "?"; }
 
-// Prefer "F. Lastname" when possible; else FPL web_name.
+export function posName(et) { return ({ 1: "GK", 2: "DEF", 3: "MID", 4: "FWD" })[et] || "?"; }
+
+// --- NEW: compact name helper (short names) ---
+// Prefer concise "F. Lastname" vs web_name; choose the shorter readable form.
 export function nameShort(el) {
   const first = (el?.first_name || "").trim();
   const last  = (el?.second_name || "").trim();
   const web   = (el?.web_name || "").trim();
-  if (first && last) return `${first[0]}. ${last}`;
-  return web || "—";
+  // Build "F. Lastname" when possible
+  const initLast = first && last ? `${first[0]}. ${last}` : (last || web || first || "—");
+  // Many FPL web_names are already succinct (e.g., "Gabriel", "Raya")
+  if (web && web.length <= initLast.length) return web;
+  return initLast || "—";
 }
