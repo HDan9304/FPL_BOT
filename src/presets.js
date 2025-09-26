@@ -1,72 +1,57 @@
-// src/presets.js — named presets + adaptive auto
+// src/presets.js — central presets & auto chooser (Pro Auto)
 
-export const PRESETS = {
-  PRO:   { h: 2, min: 80, damp: 0.93, ft: 1, hit: 5 },
-  SAFE:  { h: 2, min: 85, damp: 0.95, ft: 1, hit: 6 },
-  CHASE: { h: 3, min: 75, damp: 0.92, ft: 1, hit: 4 }
-};
-
-// ---- adaptive auto (Pro baseline) ----
-export function autoPreset(ctx, base = PRESETS.PRO) {
-  // ctx: { bootstrap, fixtures, picks }
-  const { bootstrap, fixtures, picks } = ctx || {};
-  const cfg = { ...base };
-
-  // FT assumption for next GW
-  const used = usedTransfersThisGw(picks);
-  cfg.ft = (used === 0) ? 2 : 1;
-
-  // Team fragility → tighten minutes + raise hit threshold
-  const risky = riskyStartersCount(picks, bootstrap, 80);
-  if (risky >= 3) { cfg.min = Math.max(cfg.min, 86); cfg.hit = Math.max(cfg.hit, 6); }
-  else if (risky >= 2) { cfg.min = Math.max(cfg.min, 83); cfg.hit = Math.max(cfg.hit, 6); }
-
-  // Calendar context (DGW/Blank) → adjust horizon & damp
-  const nextGW = nextGwId(bootstrap);
-  const counts = gwFixtureCounts(fixtures, nextGW);
-  const dgwTeams = Object.keys(counts).filter(t => counts[t] > 1).length;
-  const blankTeams = teamIds(bootstrap).filter(t => (counts[t] || 0) === 0).length;
-
-  if (dgwTeams >= 6) { cfg.h = Math.max(cfg.h, 3); cfg.damp = Math.max(cfg.damp, 0.94); }
-  if (blankTeams >= 6) { cfg.h = Math.min(cfg.h, 2); cfg.min = Math.max(cfg.min, 85); }
-
-  return cfg;
-}
-
-/* ---- small helpers (local to preset) ---- */
-function riskyStartersCount(picks, bootstrap, minCut=80){
-  const byId = Object.fromEntries((bootstrap?.elements||[]).map(e=>[e.id,e]));
-  const xi = (picks?.picks||[]).filter(p => (p.position||16) <= 11);
-  let n=0;
-  for (const p of xi){
+function riskyStartersCount(picks, bootstrap, minCut = 80) {
+  const byId = Object.fromEntries((bootstrap?.elements || []).map(e => [e.id, e]));
+  const xi = (picks?.picks || []).filter(p => (p.position || 16) <= 11);
+  let n = 0;
+  for (const p of xi) {
     const el = byId[p.element]; if (!el) continue;
-    const mp = parseInt(el?.chance_of_playing_next_round ?? "100", 10);
+    const mp = parseInt(el.chance_of_playing_next_round ?? "100", 10);
     if (!Number.isFinite(mp) || mp < minCut) n++;
   }
   return n;
 }
-function usedTransfersThisGw(picks){
+
+function usedTransfersThisGw(picks) {
   const eh = picks?.entry_history;
   return (typeof eh?.event_transfers === "number") ? eh.event_transfers : null;
 }
-function nextGwId(bootstrap){
-  const ev = bootstrap?.events || [];
-  const nxt = ev.find(e => e.is_next); if (nxt) return nxt.id;
-  const cur = ev.find(e => e.is_current);
-  if (cur) {
-    const i = ev.findIndex(x => x.id === cur.id);
-    return ev[i+1]?.id || cur.id;
+
+// Base “Pro Auto” defaults (same behavior you had before we centralized config)
+const PRO_BASE = { name: "Pro Auto", h: 2, min: 78, damp: 0.94, hit: 5 };
+
+/**
+ * Choose the auto config (Pro) with light adaptation to squad fragility.
+ * @param {{bootstrap: any, fixtures: any, picks: any, entry?: any, mode?: "pro", chase?: boolean}} ctx
+ * @returns {{presetName:string, h:number, min:number, damp:number, hit:number, ft:number}}
+ */
+export function chooseAutoConfig(ctx) {
+  const { bootstrap, picks, chase = false } = (ctx || {});
+  const cfg = { ...PRO_BASE };
+
+  // FT assumption for next GW: if you haven't used any FT this GW, assume 2 next; else 1.
+  const usedThis = usedTransfersThisGw(picks);
+  cfg.ft = (usedThis === 0) ? 2 : 1;
+
+  // Tighten minutes threshold if you have multiple risky starters
+  const riskyN = riskyStartersCount(picks, bootstrap, 80);
+  if (riskyN >= 2) cfg.min = Math.max(cfg.min, 85);
+
+  // Damp stays gentle for DGW stacking
+  cfg.damp = 0.94;
+
+  // Hits tolerance: stricter if very fragile
+  if (riskyN >= 3) cfg.hit = Math.max(cfg.hit, 6);
+
+  // “Chasing” mode (optional arg) relaxes minutes & lowers hit threshold slightly
+  if (chase) {
+    cfg.min = Math.min(cfg.min, 75);
+    cfg.hit = 4;
   }
-  const up = ev.find(e => !e.finished);
-  return up ? up.id : (ev[ev.length-1]?.id || 1);
+
+  cfg.presetName = PRO_BASE.name + (chase ? " + Chase" : "");
+  return cfg;
 }
-function teamIds(bootstrap){ return (bootstrap?.teams||[]).map(t=>String(t.id)); }
-function gwFixtureCounts(fixtures, gw){
-  const map = {};
-  for (const f of (fixtures||[])) {
-    if (f.event !== gw) continue;
-    map[f.team_h] = (map[f.team_h]||0) + 1;
-    map[f.team_a] = (map[f.team_a]||0) + 1;
-  }
-  return map;
-}
+
+// Also provide a default export for flexibility (import chooseAutoConfig from "...").
+export default { chooseAutoConfig };
