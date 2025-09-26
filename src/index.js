@@ -1,28 +1,32 @@
-// src/index.js
-import startCmd     from "./commands/start.js";
-import linkCmd      from "./commands/link.js";
-import unlinkCmd    from "./commands/unlink.js";
-import transferCmd  from "./commands/transfer.js";
-import planCmd      from "./commands/plan.js";
+// src/index.js — Cloudflare Worker entry & router
+// Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET
+// KV binding: FPL_BOT_KV
+// Commands wired: /start, /link (alias /linkteam), /unlink, /transfer, /plan
 
-import { send } from "./utils/telegram.js";
+import startCmd    from "./commands/start.js";
+import linkCmd     from "./commands/link.js";
+import unlinkCmd   from "./commands/unlink.js";
+import transferCmd from "./commands/transfer.js";
+import planCmd     from "./commands/plan.js";
+import { send }    from "./utils/telegram.js";
 
-const parseCmd = (t) => {
-  if (!t?.startsWith?.("/")) return { name: "", args: [] };
-  const parts = t.split(/\s+/);
-  return { name: parts[0].slice(1).toLowerCase(), args: parts.slice(1) };
-};
+// Small helper
+const text = (s, status = 200) =>
+  new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 
 export default {
   async fetch(req, env) {
     const url  = new URL(req.url);
     const path = url.pathname.replace(/\/$/, "");
 
-    if (req.method === "GET" && (path === "" || path === "/")) return new Response("OK");
+    // Health
+    if (req.method === "GET" && (path === "" || path === "/")) return text("OK");
+
+    // Init webhook
     if (req.method === "GET" && path === "/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json; charset=utf-8" },
         body: JSON.stringify({
           url: `${url.origin}/webhook/telegram`,
           secret_token: env.TELEGRAM_WEBHOOK_SECRET,
@@ -30,37 +34,92 @@ export default {
           drop_pending_updates: true
         })
       });
-      const j = await r.json().catch(()=>({}));
-      return new Response(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, { status: j?.ok ? 200 : 500 });
+      const j = await r.json().catch(() => ({}));
+      return text(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, j?.ok ? 200 : 500);
     }
 
+    // Simple diag
+    if (req.method === "GET" && path === "/diag") {
+      const ok = Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_WEBHOOK_SECRET);
+      return new Response(JSON.stringify({ ok }, null, 2), {
+        headers: { "content-type": "application/json" }
+      });
+    }
+
+    // Telegram webhook
     if (path === "/webhook/telegram") {
-      if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+      if (req.method !== "POST") return text("Method Not Allowed", 405);
       if (req.headers.get("x-telegram-bot-api-secret-token") !== env.TELEGRAM_WEBHOOK_SECRET)
-        return new Response("Forbidden", { status: 403 });
+        return text("Forbidden", 403);
 
-      let update; try { update = await req.json(); } catch { return new Response("ok"); }
-      const msg = update?.message;
-      if (!msg?.chat?.id) return new Response("ok");
+      let update;
+      try { update = await req.json(); } catch { return text("Bad Request", 400); }
+
+      const msg = update?.message || update?.edited_message;
+      if (!msg?.chat?.id) return text("ok");
+
       const chatId = msg.chat.id;
-      const t = (msg.text || "").trim();
-      const { name } = parseCmd(t);
+      const { cmd, arg } = extractCommand(msg);
 
-      // routes
-      if (!name || name === "start") { await startCmd(env, chatId, msg.from); return new Response("ok"); }
-      if (name === "link")    { await linkCmd(env, chatId, t.split(/\s+/).slice(1)); return new Response("ok"); }
-      if (name === "unlink")  { await unlinkCmd(env, chatId); return new Response("ok"); }
-      if (name === "transfer"){ await transferCmd(env, chatId); return new Response("ok"); }
+      // No command → show /start
+      if (!cmd) { await startCmd(env, chatId, msg.from); return text("ok"); }
 
-      if (name === "plan")   { await planCmd(env, chatId, "A"); return new Response("ok"); }
-      if (name === "planb")  { await planCmd(env, chatId, "B"); return new Response("ok"); }
-      if (name === "planc")  { await planCmd(env, chatId, "C"); return new Response("ok"); }
-      if (name === "pland")  { await planCmd(env, chatId, "D"); return new Response("ok"); }
+      // Route
+      if (cmd === "/start") {
+        await startCmd(env, chatId, msg.from); return text("ok");
+      }
 
-      await send(env, chatId, "Unknown command. Try /start", "HTML");
-      return new Response("ok");
+      if (cmd === "/link" || cmd === "/linkteam") {
+        await linkCmd(env, chatId, arg); return text("ok");
+      }
+
+      if (cmd === "/unlink" || cmd === "/unlinkteam") {
+        await unlinkCmd(env, chatId); return text("ok");
+      }
+
+      if (cmd === "/transfer") {
+        await transferCmd(env, chatId, arg); return text("ok");
+      }
+
+      if (cmd === "/plan") {
+        await planCmd(env, chatId, arg); return text("ok");
+      }
+
+      // Fallback: unknown → /start
+      await startCmd(env, chatId, msg.from);
+      return text("ok");
     }
 
-    return new Response("Not Found", { status: 404 });
+    return text("Not Found", 404);
   }
 };
+
+/* ------------ command parsing (robust) ------------- */
+function extractCommand(msg) {
+  const raw = (msg.text || msg.caption || "").trim();
+  if (!raw) return { cmd: null, arg: "" };
+
+  // Prefer Telegram's entity for commands at offset 0 when present
+  const ent = (msg.entities || msg.caption_entities || []).find(
+    (e) => e.type === "bot_command" && e.offset === 0
+  );
+
+  let cmd = null;
+  let arg = "";
+
+  if (ent) {
+    cmd = raw.slice(ent.offset, ent.offset + ent.length);
+    arg = raw.slice(ent.offset + ent.length).trim();
+  } else if (raw.startsWith("/")) {
+    const sp = raw.indexOf(" ");
+    cmd = sp === -1 ? raw : raw.slice(0, sp);
+    arg = sp === -1 ? "" : raw.slice(sp + 1).trim();
+  }
+
+  if (!cmd) return { cmd: null, arg: "" };
+
+  // Strip @BotUser suffix if present
+  cmd = cmd.replace(/@\S+$/, "").toLowerCase();
+
+  return { cmd, arg };
+}
