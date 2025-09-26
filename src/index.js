@@ -1,27 +1,28 @@
-// src/index.js — Cloudflare Worker entry (static imports)
+// src/index.js
 import startCmd     from "./commands/start.js";
-import planCmd      from "./commands/plan.js";
-import transferCmd  from "./commands/transfer.js";
 import linkCmd      from "./commands/link.js";
 import unlinkCmd    from "./commands/unlink.js";
+import transferCmd  from "./commands/transfer.js";
+import planCmd      from "./commands/plan.js";
 
-const text = (s, status = 200) =>
-  new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
+import { send } from "./utils/telegram.js";
+
+const parseCmd = (t) => {
+  if (!t?.startsWith?.("/")) return { name: "", args: [] };
+  const parts = t.split(/\s+/);
+  return { name: parts[0].slice(1).toLowerCase(), args: parts.slice(1) };
+};
 
 export default {
   async fetch(req, env) {
     const url  = new URL(req.url);
     const path = url.pathname.replace(/\/$/, "");
 
-    // Health
-    if (req.method === "GET" && (path === "" || path === "/"))
-      return text("OK");
-
-    // One-click webhook init
+    if (req.method === "GET" && (path === "" || path === "/")) return new Response("OK");
     if (req.method === "GET" && path === "/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method: "POST",
-        headers: { "content-type": "application/json; charset=utf-8" },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({
           url: `${url.origin}/webhook/telegram`,
           secret_token: env.TELEGRAM_WEBHOOK_SECRET,
@@ -29,39 +30,37 @@ export default {
           drop_pending_updates: true
         })
       });
-      const j = await r.json().catch(() => ({}));
-      return text(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, j?.ok ? 200 : 500);
+      const j = await r.json().catch(()=>({}));
+      return new Response(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, { status: j?.ok ? 200 : 500 });
     }
 
-    // Telegram webhook
     if (path === "/webhook/telegram") {
-      if (req.method !== "POST") return text("Method Not Allowed", 405);
+      if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
       if (req.headers.get("x-telegram-bot-api-secret-token") !== env.TELEGRAM_WEBHOOK_SECRET)
-        return text("Forbidden", 403);
+        return new Response("Forbidden", { status: 403 });
 
-      let update;
-      try { update = await req.json(); } catch { return text("Bad Request", 400); }
+      let update; try { update = await req.json(); } catch { return new Response("ok"); }
       const msg = update?.message;
-      if (!msg) return text("ok");
+      if (!msg?.chat?.id) return new Response("ok");
+      const chatId = msg.chat.id;
+      const t = (msg.text || "").trim();
+      const { name } = parseCmd(t);
 
-      const chatId = msg?.chat?.id;
-      const txt    = (msg?.text || "").trim();
-      if (!chatId || !txt) return text("ok");
+      // routes
+      if (!name || name === "start") { await startCmd(env, chatId, msg.from); return new Response("ok"); }
+      if (name === "link")    { await linkCmd(env, chatId, t.split(/\s+/).slice(1)); return new Response("ok"); }
+      if (name === "unlink")  { await unlinkCmd(env, chatId); return new Response("ok"); }
+      if (name === "transfer"){ await transferCmd(env, chatId); return new Response("ok"); }
 
-      const [raw] = txt.split(/\s+/);
-      const cmd = raw.toLowerCase();
+      if (name === "plan")   { await planCmd(env, chatId, "A"); return new Response("ok"); }
+      if (name === "planb")  { await planCmd(env, chatId, "B"); return new Response("ok"); }
+      if (name === "planc")  { await planCmd(env, chatId, "C"); return new Response("ok"); }
+      if (name === "pland")  { await planCmd(env, chatId, "D"); return new Response("ok"); }
 
-      if (cmd === "/start")    { await startCmd(env, chatId, msg.from); return text("ok"); }
-      if (cmd === "/plan")     { await planCmd(env, chatId);            return text("ok"); }
-      if (cmd === "/transfer") { await transferCmd(env, chatId);        return text("ok"); }
-      if (cmd === "/link")     { await linkCmd(env, chatId, msg);       return text("ok"); }
-      if (cmd === "/unlink")   { await unlinkCmd(env, chatId);          return text("ok"); }
-
-      // Fallback
-      await startCmd(env, chatId, msg.from);
-      return text("ok");
+      await send(env, chatId, "Unknown command. Try /start", "HTML");
+      return new Response("ok");
     }
 
-    return text("Not Found", 404);
+    return new Response("Not Found", { status: 404 });
   }
 };
