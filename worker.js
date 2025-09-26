@@ -45,7 +45,7 @@ export default {
         case "start":    await handleStart(env, msg); break;
         case "linkteam": await handleLinkTeam(env, msg, cmd.args); break;
         case "myteam":   await handleMyTeam(env, msg); break;
-        default: /* silent for now */ break;
+        default: /* silent */ break;
       }
       return text("ok");
     }
@@ -63,14 +63,14 @@ async function handleStart(env, msg) {
   const html = [
     `<b>${htmlEsc(`Hey ${first}!`)}</b>`,
     ``,
-    htmlEsc(`I'm your FPL helper. I can show your current gameweek stats and summarize your linked team.`),
+    htmlEsc(`I help you view clean, current gameweek info for your FPL team.`),
     ``,
-    `${htmlEsc(`Link your team:`)}  <code>/linkteam &lt;YourTeamID&gt;</code>`,
+    `${boldLabel("Link Team")} <code>/linkteam &lt;YourTeamID&gt;</code>`,
     ``,
-    `${htmlEsc(`Your team (this GW):`)}  <code>/myteam</code>`
+    `${boldLabel("My Team (Current GW)")} <code>/myteam</code>`
   ].join("\n");
 
-  await sendHTML(env, chatId, html);
+  await sendHTML(env, chatId, html, keyboardMain());
 }
 
 async function handleLinkTeam(env, msg, args) {
@@ -79,28 +79,26 @@ async function handleLinkTeam(env, msg, args) {
 
   if (!idRaw) {
     const guide = [
-      `<b>${htmlEsc("Link your FPL team")}</b>`,
+      `<b>${htmlEsc("Link Your FPL Team")}</b>`,
       ``,
-      htmlEsc("Where to find your Team ID:"),
-      htmlEsc("1) Open fantasy.premierleague.com and go to My Team"),
-      htmlEsc("2) Look at the URL: it shows /entry/1234567/ - that's your ID"),
+      `${boldLabel("Where To Find Team ID")} ${htmlEsc("Open fantasy.premierleague.com → My Team")}`,
+      `${htmlEsc("Look at the URL: it shows")} <code>/entry/1234567/</code> ${htmlEsc("- that's your ID")}`,
       ``,
-      htmlEsc("Send the command like this:"),
-      `<pre><code>/linkteam 1234567</code></pre>`
+      `${boldLabel("How To Link")} <pre><code>/linkteam 1234567</code></pre>`
     ].join("\n");
-    await sendHTML(env, chatId, guide);
+    await sendHTML(env, chatId, guide, keyboardMain());
     return;
   }
 
   const teamId = Number(idRaw);
   if (!Number.isInteger(teamId) || teamId <= 0) {
-    await sendHTML(env, chatId, htmlEsc("Please provide a valid numeric team ID, e.g. /linkteam 1234567"));
+    await sendHTML(env, chatId, `${boldLabel("Tip")} ${htmlEsc("Use a numeric ID, e.g.")} <code>/linkteam 1234567</code>`, keyboardMain());
     return;
   }
 
   const entry = await fplEntry(teamId);
   if (!entry) {
-    await sendHTML(env, chatId, htmlEsc("I couldn't find that team. Double-check the ID and try again."));
+    await sendHTML(env, chatId, `${boldLabel("Not Found")} ${htmlEsc("That team ID didn’t resolve. Double-check and try again.")}`, keyboardMain());
     return;
   }
 
@@ -111,17 +109,16 @@ async function handleLinkTeam(env, msg, args) {
   const manager  = sanitizeAscii(`${entry.player_first_name || ""} ${entry.player_last_name || ""}`.trim());
 
   const html = [
-    `<b>${htmlEsc("Team linked")}</b> ✅`,
+    `<b>${htmlEsc("Team Linked")}</b> ✅`,
     ``,
-    `${htmlEsc("Team:")}  <b>${htmlEsc(teamName)}</b>`,
-    manager ? `${htmlEsc("Manager:")}  ${htmlEsc(manager)}` : "",
-    `${htmlEsc("Team ID:")}  ${htmlEsc(String(teamId))}`,
+    `${boldLabel("Team")} <b>${htmlEsc(teamName)}</b>`,
+    manager ? `${boldLabel("Manager")} ${htmlEsc(manager)}` : "",
+    `${boldLabel("Team ID")} ${htmlEsc(String(teamId))}`,
     ``,
-    htmlEsc("Next:"),
-    `<code>/myteam</code>  ${htmlEsc("(your team this GW)")}`
+    `${boldLabel("Next")} <code>/myteam</code> ${htmlEsc("(current GW)")}`
   ].filter(Boolean).join("\n");
 
-  await sendHTML(env, chatId, html);
+  await sendHTML(env, chatId, html, keyboardMain());
 }
 
 async function handleMyTeam(env, msg) {
@@ -130,22 +127,22 @@ async function handleMyTeam(env, msg) {
   const teamId = prof?.teamId;
   if (!teamId) {
     const html = [
-      htmlEsc("You haven't linked a team yet."),
+      `${boldLabel("No Team Linked")} ${htmlEsc("Add your team first:")}`,
       ``,
-      `${htmlEsc("Use:")}  <code>/linkteam &lt;YourTeamID&gt;</code>`
+      `<code>/linkteam &lt;YourTeamID&gt;</code>`
     ].join("\n");
-    await sendHTML(env, chatId, html);
+    await sendHTML(env, chatId, html, keyboardMain());
     return;
   }
 
   // Bootstrap for current event + player names
   const boot = await fplBootstrap();
-  if (!boot) { await sendHTML(env, chatId, htmlEsc("FPL is busy. Try again shortly.")); return; }
+  if (!boot) { await sendHTML(env, chatId, `${boldLabel("Busy")} ${htmlEsc("FPL is busy. Try again shortly.")}`, keyboardMain()); return; }
 
   const currentEvent = (boot.events || []).find(e => e.is_current)
                     || (boot.events || []).filter(e => e.finished).sort((a,b)=>b.id-a.id)[0]
                     || null;
-  if (!currentEvent) { await sendHTML(env, chatId, htmlEsc("Couldn't determine the current gameweek.")); return; }
+  if (!currentEvent) { await sendHTML(env, chatId, `${boldLabel("Oops")} ${htmlEsc("Couldn't determine the current gameweek.")}`, keyboardMain()); return; }
   const gw = currentEvent.id;
 
   // Entry + history + picks (for captain)
@@ -154,7 +151,7 @@ async function handleMyTeam(env, msg) {
     fplEntryHistory(teamId),
     fplEntryPicks(teamId, gw)
   ]);
-  if (!entry || !history) { await sendHTML(env, chatId, htmlEsc("Couldn't load your team right now.")); return; }
+  if (!entry || !history) { await sendHTML(env, chatId, `${boldLabel("Error")} ${htmlEsc("Couldn't load your team right now.")}`, keyboardMain()); return; }
 
   const thisGw = (history.current || []).find(r => r.event === gw);
   const points = thisGw?.points ?? null;
@@ -162,7 +159,7 @@ async function handleMyTeam(env, msg) {
   const value  = thisGw?.value ?? history?.current?.slice(-1)?.[0]?.value ?? entry?.value ?? null; // tenths
   const bank   = thisGw?.bank ?? history?.current?.slice(-1)?.[0]?.bank ?? entry?.bank ?? null;
 
-  // Captain name
+  // Captain
   let captainName = null;
   if (picks?.picks?.length) {
     const capEl = picks.picks.find(p => p.is_captain)?.element;
@@ -176,19 +173,20 @@ async function handleMyTeam(env, msg) {
   const fmtMoney = (v) => (typeof v === "number" ? (v/10).toFixed(1) : "-");
   const fmtNum   = (n) => (typeof n === "number" ? n.toLocaleString("en-GB") : "-");
 
-  // Clear section spacing via blank lines
   const html = [
     `<b>${htmlEsc(teamName)}</b>`,
     htmlEsc(`Gameweek ${gw} (current)`),
     ``,
-    points != null ? `${htmlEsc("Points:")}  <b>${htmlEsc(String(points))}</b>` : "",
-    rank   != null ? `${htmlEsc("Overall rank:")}  ${htmlEsc(fmtNum(rank))}` : "",
-    value  != null ? `${htmlEsc("Team value:")}  ${htmlEsc(fmtMoney(value))}` : "",
-    bank   != null ? `${htmlEsc("Bank:")}  ${htmlEsc(fmtMoney(bank))}` : "",
-    captainName ? `${htmlEsc("Captain:")}  ${htmlEsc(captainName)}` : ""
+    points != null ? `${boldLabel("Points")} <b>${htmlEsc(String(points))}</b>` : "",
+    rank   != null ? `${boldLabel("Overall Rank")} ${htmlEsc(fmtNum(rank))}` : "",
+    value  != null ? `${boldLabel("Team Value")} ${htmlEsc(fmtMoney(value))}` : "",
+    bank   != null ? `${boldLabel("Bank")} ${htmlEsc(fmtMoney(bank))}` : "",
+    captainName ? `${boldLabel("Captain")} ${htmlEsc(captainName)}` : "",
+    ``,
+    `${boldLabel("Shortcuts")} <code>/myteam</code>  |  <code>/linkteam &lt;YourTeamID&gt;</code>`
   ].filter(Boolean).join("\n");
 
-  await sendHTML(env, chatId, html);
+  await sendHTML(env, chatId, html, keyboardMain());
 }
 
 /* ---------- HTTP ---------- */
@@ -196,19 +194,42 @@ const text = (s, status = 200) => new Response(s, { status, headers: { "content-
 
 /* ---------- Telegram (HTML) ---------- */
 
-async function sendHTML(env, chat_id, html) {
-  const r1 = await tg(env, "sendMessage", { chat_id, text: html, parse_mode: "HTML", disable_web_page_preview: true });
+// Reply keyboard (clean & minimal)
+function keyboardMain() {
+  return {
+    keyboard: [
+      [{ text: "/myteam" }, { text: "/linkteam" }]
+    ],
+    resize_keyboard: true,
+    one_time_keyboard: false
+  };
+}
+
+async function sendHTML(env, chat_id, html, replyKeyboard) {
+  const payload = { chat_id, text: html, parse_mode: "HTML", disable_web_page_preview: true };
+  if (replyKeyboard) payload.reply_markup = replyKeyboard;
+
+  const r1 = await tg(env, "sendMessage", payload);
   if (r1?.ok) return;
-  await tg(env, "sendMessage", { chat_id, text: stripHtml(html), disable_web_page_preview: true });
+
+  // fallback: plain text
+  const plain = stripHtml(html);
+  const payload2 = { chat_id, text: plain, disable_web_page_preview: true };
+  if (replyKeyboard) payload2.reply_markup = replyKeyboard;
+  await tg(env, "sendMessage", payload2);
 }
 
 async function tg(env, method, payload) {
   try {
     const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
-      method: "POST", headers: { "content-type": "application/json; charset=utf-8" }, body: JSON.stringify(payload)
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: JSON.stringify(payload)
     });
     return await r.json();
-  } catch { return { ok: false }; }
+  } catch {
+    return { ok: false };
+  }
 }
 
 /* ---------- FPL ---------- */
@@ -269,9 +290,10 @@ function sanitizeAscii(s) {
 function htmlEsc(s) {
   return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 }
-
-// Plain text fallback
 function stripHtml(s) { return s.replace(/<[^>]+>/g, ""); }
+
+// Label helper: **Bold first word**
+function boldLabel(label) { return `<b>${htmlEsc(label)}:</b>`; }
 
 /* ---------- KV keys ---------- */
 const kLastSeen     = id => `chat:${id}:last_seen`;
