@@ -1,17 +1,34 @@
+// Telegram webhook entry (minimal router)
+// Env: TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET
+// KV : FPL_BOT_KV
+
 import startCmd from "./commands/start.js";
 import linkCmd from "./commands/link.js";
-import { parseCmd } from "./utils/fmt.js";
+import unlinkCmd from "./commands/unlink.js";
+
+function text(s, status = 200) {
+  return new Response(s, {
+    status,
+    headers: { "content-type": "text/plain; charset=utf-8" }
+  });
+}
+
+function parseCmd(msg) {
+  const raw = (msg?.text || "").trim();
+  if (!raw.startsWith("/")) return { name: "", args: [] };
+  const parts = raw.split(/\s+/);
+  return { name: parts[0].slice(1).toLowerCase(), args: parts.slice(1) };
+}
 
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
     const path = url.pathname.replace(/\/$/, "");
 
-    // Health
-    if (req.method === "GET" && (path === "" || path === "/"))
-      return new Response("OK", { headers: { "content-type": "text/plain; charset=utf-8" } });
+    // health
+    if (req.method === "GET" && (path === "" || path === "/")) return text("OK");
 
-    // Set Telegram webhook
+    // init webhook
     if (req.method === "GET" && path === "/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method: "POST",
@@ -24,30 +41,41 @@ export default {
         })
       });
       const j = await r.json().catch(() => ({}));
-      return new Response(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, {
-        status: j?.ok ? 200 : 500,
-        headers: { "content-type": "text/plain; charset=utf-8" }
-      });
+      return text(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, j?.ok ? 200 : 500);
     }
 
-    // Telegram webhook
+    // webhook
     if (path === "/webhook/telegram") {
-      if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
-      if (req.headers.get("x-telegram-bot-api-secret-token") !== env.TELEGRAM_WEBHOOK_SECRET)
-        return new Response("Forbidden", { status: 403 });
+      if (req.method !== "POST") return text("Method Not Allowed", 405);
+      if (req.headers.get("x-telegram-bot-api-secret-token") !== env.TELEGRAM_WEBHOOK_SECRET) return text("Forbidden", 403);
 
-      let update; try { update = await req.json(); } catch { return new Response("Bad Request", { status: 400 }); }
-      const msg = update?.message; const chatId = msg?.chat?.id;
-      if (!chatId) return new Response("ok");
+      let update;
+      try { update = await req.json(); } catch { return text("OK"); }
 
-      const raw = (msg?.text || "").trim();
-      const { name } = parseCmd(raw);
+      const msg = update?.message;
+      if (!msg?.chat?.id) return text("OK");
 
-      if (name === "link") { await linkCmd(env, chatId, msg); return new Response("ok"); }
-      await startCmd(env, chatId, msg); // default
-      return new Response("ok");
+      const chatId = msg.chat.id;
+      const { name } = parseCmd(msg);
+
+      if (name === "start" || name === "") {
+        await startCmd(env, chatId, msg.from);
+        return text("OK");
+      }
+      if (name === "link" || name === "linkteam") {
+        await linkCmd(env, chatId, msg);
+        return text("OK");
+      }
+      if (name === "unlink") {
+        await unlinkCmd(env, chatId);
+        return text("OK");
+      }
+
+      // fallback -> show start
+      await startCmd(env, chatId, msg.from);
+      return text("OK");
     }
 
-    return new Response("Not Found", { status: 404 });
+    return text("Not Found", 404);
   }
 };
