@@ -1,11 +1,11 @@
-// worker.js — commands only (no keyboards), /transfer adds Priority Watchlist + tappable /transfer1 | /transfer3 shortcuts
+// worker.js — commands + inline buttons on /transfer: [Refresh] [Full/Simple]
 
 export default {
   async fetch(req, env) {
     const u = new URL(req.url), p = u.pathname.replace(/\/$/,"");
     if (req.method==="GET" && (p===""||p==="/")) return R("OK");
 
-    // Init webhook (message-only)
+    // Init webhook (message + callback_query)
     if (req.method==="GET" && p==="/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method:"POST",
@@ -13,7 +13,7 @@ export default {
         body:JSON.stringify({
           url:`${u.origin}/webhook/telegram`,
           secret_token: env.TELEGRAM_WEBHOOK_SECRET,
-          allowed_updates:["message"],
+          allowed_updates:["message","callback_query"],
           drop_pending_updates:true
         })
       });
@@ -27,24 +27,51 @@ export default {
       if (req.headers.get("x-telegram-bot-api-secret-token")!==env.TELEGRAM_WEBHOOK_SECRET) return R("Forbidden",403);
       let up; try { up = await req.json() } catch { return R("Bad Request",400) }
 
-      const msg = up?.message;
+      const msg = up?.message, cq = up?.callback_query;
+
+      // text commands
       if (msg) {
         const chatId = msg?.chat?.id, t = (msg?.text||"").trim();
         if (!chatId) return R("ok");
         await env.FPL_BOT_KV.put(K.last(chatId), String(Date.now()));
-
         const c = cmd(t);
         switch (c.name) {
           case "start":       await handleStart(env, chatId, msg.from); break;
           case "linkteam":    await handleLinkTeam(env, chatId, c.args); break;
           case "myteam":      await handleMyTeam(env, chatId); break;
-          case "transfer":    await handleTransfer(env, chatId, c.args); break;
-          case "transfer1":   await handleTransfer(env, chatId, ["1"]); break;
-          case "transfer3":   await handleTransfer(env, chatId, ["3"]); break;
-          case "tranfer3":    await handleTransfer(env, chatId, ["3"]); break; // typo-safe
+          case "transfer":    await handleTransfer(env, chatId, {h: num(c.args?.[0])||1, view:"full"}); break;
+          case "transfer1":   await handleTransfer(env, chatId, {h:1, view:"full"}); break;
+          case "transfer3":   await handleTransfer(env, chatId, {h:3, view:"full"}); break;
+          case "tranfer3":    await handleTransfer(env, chatId, {h:3, view:"full"}); break; // typo-safe
           default:            await handleStart(env, chatId, msg.from); break;
         }
+        return R("ok");
       }
+
+      // inline button callbacks
+      if (cq) {
+        const chatId = cq?.message?.chat?.id;
+        const data = cq?.data||"";
+        if (!chatId) return R("ok");
+        await env.FPL_BOT_KV.put(K.last(chatId), String(Date.now()));
+        await tg(env,"answerCallbackQuery",{callback_query_id:cq.id});
+        // formats:
+        // xfer:refresh:h=1:v=full
+        // xfer:toggle:h=1:v=full|simple
+        if (data.startsWith("xfer:")) {
+          const m = Object.fromEntries((data.split(":").slice(1).join(":").split("&").map(kv=>kv.split("="))).map(([k,v])=>[k,v]));
+          const h = Math.max(1, Math.min(3, num(m.h)||1));
+          const view = (m.v==="simple")?"simple":"full";
+          if (data.startsWith("xfer:toggle")) {
+            const nextView = view==="full" ? "simple" : "full";
+            await handleTransfer(env, chatId, {h, view: nextView}, cq.message);
+          } else {
+            await handleTransfer(env, chatId, {h, view}, cq.message);
+          }
+        }
+        return R("ok");
+      }
+
       return R("ok");
     }
 
@@ -54,24 +81,24 @@ export default {
 
 const R = (s, st=200) => new Response(s, { status: st, headers:{"content-type":"text/plain; charset=utf-8"} });
 
-/* ---------- commands (no buttons) ---------- */
+/* ---------- commands ---------- */
 async function handleStart(env, chatId, from){
   const f = ascii((from?.first_name||"there").trim());
   const html = [
     `<b>${esc(`Hey ${f}!`)}</b>`,
     "",
-    esc("Use plain commands (no buttons):"),
+    esc("Use commands (buttons only under /transfer):"),
     "",
     `${B("Link Team")} <code>/linkteam &lt;YourTeamID&gt;</code>`,
     `${B("My Team")} <code>/myteam</code>`,
-    `${B("Transfer Planner")} <code>/transfer</code>`,
-    `${B("Transfer Planner with horizon")} <code>/transfer 3</code>`
+    `${B("Transfer Planner (full)")} <code>/transfer</code>`,
+    `${B("Transfer Planner horizon 3")} <code>/transfer 3</code>`
   ].join("\n");
   await sendHTML(env, chatId, html);
 }
 
 async function handleLinkTeam(env, chatId, args){
-  const raw = (args[0]||"").trim();
+  const raw = (args?.[0]||"").trim();
   if (!raw) {
     const g = [
       `<b>${esc("Link Your FPL Team")}</b>`,
@@ -156,7 +183,11 @@ async function handleMyTeam(env, chatId){
   await sendHTML(env, chatId, html);
 }
 
-async function handleTransfer(env, chatId, args){
+/* ---------- /transfer core (supports view=full|simple) ---------- */
+async function handleTransfer(env, chatId, opts={}, editMsg /* optional message to edit */){
+  const h = Math.max(1,Math.min(3, num(opts.h)||1));
+  const view = (opts.view==="simple")?"simple":"full";
+
   const prof=await env.FPL_BOT_KV.get(K.user(chatId)).then(j=>j&&JSON.parse(j)).catch(()=>null), tid=prof?.teamId;
   if(!tid) return sendHTML(env, chatId, [`${B("No Team Linked")} ${esc("Add your team first:")}`,"",`<code>/linkteam &lt;YourTeamID&gt;</code>`].join("\n"));
 
@@ -169,7 +200,6 @@ async function handleTransfer(env, chatId, args){
   if(!curId||!nextId) return sendHTML(env, chatId, `${B("Oops")} ${esc("Can't resolve next gameweek yet.")}`);
 
   const dlRaw=next?.deadline_time||null, dlMs=dlRaw?new Date(dlRaw).getTime():null, beforeDL=dlMs?Date.now()<dlMs:false;
-  const horizon=Math.max(1,Math.min(3, parseInt((args?.[0]||"1"),10)||1));
 
   const curPicks=await fplEntryPicks(tid,curId), prevPicks=(curId>1)?await fplEntryPicks(tid,curId-1):null;
   const activeChip=curPicks?.active_chip||null, base=(activeChip==="freehit"&&prevPicks?.picks?.length)?prevPicks:curPicks;
@@ -177,6 +207,7 @@ async function handleTransfer(env, chatId, args){
 
   // Fixtures map gw->teamId -> [{oppId, home, diff}]
   const fixMap=new Map(), key=(gw,tid)=>`${gw}:${tid}`;
+  const horizon = h; // overall horizon
   for (let g=0; g<horizon; g++){
     const gw = nextId + g;
     const fx = await fplFixtures(gw); if(!fx) continue;
@@ -195,13 +226,14 @@ async function handleTransfer(env, chatId, args){
   };
   const tough=(teamId,gw)=>{const a=fixMap.get(key(gw,teamId))||[];if(a.length===0)return {label:"BLANK",isBlank:true,isTough:false,isDGW:false};const tAny=a.some(v=>v.diff>=4);return {label:fmtF(teamId,gw),isBlank:false,isTough:tAny,isDGW:a.length>1}};
 
-  // Build Base Squad groups with fixtures
+  // Build groups
   const picks=(base?.picks||[]).slice().sort((a,b)=>a.position-b.position), XI=picks.filter(p=>p.position<=11), BN=picks.filter(p=>p.position>=12);
+  const perPlayerH = (view==="simple") ? 1 : horizon;
   const mk=(p)=>{ const e=elMap.get(p.element); if(!e) return null;
     const sp=sellPrice(p,e);
     let s=`${e.web_name} (${abbr(e.team)}, ${pos(e.element_type)}) £${(sp/10).toFixed(1)} sell — ${fmtF(e.team,nextId)}`;
-    if(horizon>1) s+=`\n   +1: ${fmtF(e.team,nextId+1)}`;
-    if(horizon>2) s+=`\n   +2: ${fmtF(e.team,nextId+2)}`;
+    if(perPlayerH>1) s+=`\n   +1: ${fmtF(e.team,nextId+1)}`;
+    if(perPlayerH>2) s+=`\n   +2: ${fmtF(e.team,nextId+2)}`;
     return esc(s);
   };
   const G={GK:[],DEF:[],MID:[],FWD:[]}, Bench=[];
@@ -210,55 +242,35 @@ async function handleTransfer(env, chatId, args){
   }
   for (const p of BN){ const ln=mk(p); if(ln) Bench.push(ln); }
 
-  // ----- Risk flags & Priority Watchlist -----
-  const riskItems=[];
-  const riskFor=(p)=>{ const e=elMap.get(p.element); if(!e) return null;
-    const N=tough(e.team,nextId), N1=horizon>1?tough(e.team,nextId+1):null;
-    const chance=Number.isFinite(e.chance_of_playing_next_round)?e.chance_of_playing_next_round:null;
-    const status=e.status||"";
-    const injFlag=(status!=="a") || (chance!=null && chance<75);               // injured/doubtful/suspended or <75%
-    const lowMin=(chance!=null && chance>0 && chance<75);                      // explicit minutes risk
-    const blankFlag=N.isBlank;                                                 // blank in N
-    const toughN=N.isTough;                                                    // difficulty >=4 in N
-    const toughN1=N1?N1.isTough:false;                                        // difficulty >=4 in N+1
-    const dgwGood=N.isDGW && !toughN;                                         // DGW but not tough → soften
-    const netOut=(e.transfers_out_event||0)-(e.transfers_in_event||0);
-    const dropRisk=(netOut>20000)&&((e.cost_change_event_fall||0)===0);
-
-    let score=0;
-    if(blankFlag) score+=50;
-    if(injFlag)   score+=40;
-    if(lowMin)    score+=30;
-    if(toughN)    score+=25;
-    if(toughN1)   score+=10;
-    if(dropRisk)  score+=10;
-    if(dgwGood)   score-=10;
-
-    const flags=[];
-    if(blankFlag) flags.push("BLANK");
-    if(N.isDGW)   flags.push("DGW");
-    if(injFlag)   flags.push(chance===0?"OUT":"FLAG");
-    else if(lowMin) flags.push("MIN?");
-    if(toughN)    flags.push(`Tough N`);
-    if(toughN1)   flags.push(`Tough N+1`);
-    if(dropRisk)  flags.push("£ drop?");
-
-    const baseName=`${e.web_name} (${abbr(e.team)}, ${pos(e.element_type)})`;
-    const annotate = [`N: ${N.label}`];
-    if(horizon>1) annotate.push(`N+1: ${N1?N1.label:"—"}`);
-    return {score, text:`${esc(baseName)} — ${esc(flags.join(", ")||"OK")}\n   ${esc(annotate.join("  |  "))}`};
-  };
-
-  for(const p of picks){
-    const r=riskFor(p);
-    if(r) riskItems.push(r);
+  // Priority Watchlist (only in full view)
+  let watchTop = "";
+  if (view==="full") {
+    const riskItems=[], riskFor=(p)=>{ const e=elMap.get(p.element); if(!e) return null;
+      const N=tough(e.team,nextId), N1=(horizon>1)?tough(e.team,nextId+1):null;
+      const chance=Number.isFinite(e.chance_of_playing_next_round)?e.chance_of_playing_next_round:null;
+      const status=e.status||"";
+      const injFlag=(status!=="a") || (chance!=null && chance<75);
+      const lowMin=(chance!=null && chance>0 && chance<75);
+      const blankFlag=N.isBlank, toughN=N.isTough, toughN1=N1?N1.isTough:false, dgwGood=N.isDGW && !toughN;
+      const netOut=(e.transfers_out_event||0)-(e.transfers_in_event||0);
+      const dropRisk=(netOut>20000)&&((e.cost_change_event_fall||0)===0);
+      let score=0;
+      if(blankFlag) score+=50; if(injFlag) score+=40; if(lowMin) score+=30; if(toughN) score+=25; if(toughN1) score+=10; if(dropRisk) score+=10; if(dgwGood) score-=10;
+      const flags=[]; if(blankFlag) flags.push("BLANK"); if(N.isDGW) flags.push("DGW");
+      if(injFlag) flags.push(chance===0?"OUT":"FLAG"); else if(lowMin) flags.push("MIN?");
+      if(toughN) flags.push("Tough N"); if(toughN1) flags.push("Tough N+1"); if(dropRisk) flags.push("£ drop?");
+      const baseName=`${e.web_name} (${abbr(e.team)}, ${pos(e.element_type)})`;
+      const ann=[`N: ${N.label}`]; if(horizon>1) ann.push(`N+1: ${N1?N1.label:"—"}`);
+      return {score, text:`${esc(baseName)} — ${esc(flags.join(", ")||"OK")}\n   ${esc(ann.join("  |  "))}`};
+    };
+    for(const p of picks){ const r=riskFor(p); if(r) riskItems.push(r) }
+    riskItems.sort((a,b)=>b.score-a.score);
+    watchTop = riskItems.filter(r=>r.score>0).slice(0,8).map(r=>`• ${r.text}`).join("\n");
   }
-  riskItems.sort((a,b)=>b.score-a.score);
-  const watchTop = riskItems.filter(r=>r.score>0).slice(0,8).map(r=>`• ${r.text}`).join("\n");
 
-  // ----- Header + body -----
+  // Header
   const fmtUTC=d=>{const z=n=>String(n).padStart(2,"0");return `${d.getUTCFullYear()}-${z(d.getUTCMonth()+1)}-${z(d.getUTCDate())} ${z(d.getUTCHours())}:${z(d.getUTCMinutes())} UTC`};
-  const countdown=ms=>{ if(ms<=0) return "deadline passed"; const d=Math.floor(ms/864e5), h=Math.floor(ms%864e5/36e5), m=Math.floor(ms%36e5/6e4); return `${d}d ${h}h ${m}m` };
+  const countdown=ms=>{ if(ms<=0) return "deadline passed"; const d=Math.floor(ms/864e5), h2=Math.floor(ms%864e5/36e5), m=Math.floor(ms%36e5/6e4); return `${d}d ${h2}h ${m}m` };
   const dlStr=dlRaw?fmtUTC(new Date(dlRaw)):"—", leftMs=dlMs!=null?dlMs-Date.now():null, leftStr=leftMs!=null?countdown(leftMs):"—";
   const reason=(ftNext===2)?"0 transfers used this GW + before deadline → rollover to 2 FTs.":"Standard 1 FT for next GW.";
   const tip= leftMs==null ? "When prices are volatile, act after pressers; otherwise 12–24h before deadline."
@@ -283,16 +295,34 @@ async function handleTransfer(env, chatId, args){
     `\n${B("Bench")} \n${bullets(Bench)}`
   ].join("\n\n");
 
-  const watchTitle = watchTop ? `\n${B("Priority Watchlist (GW N)")} ${esc("(highest concern first)")}\n` : "";
-  const shortcuts = `\n${B("Shortcuts")} /transfer1  ${esc("|")}  /transfer3`; // tappable commands to refresh
+  const watchTitle = (view==="full" && watchTop) ? `\n${B("Priority Watchlist (GW N)")} ${esc("(highest concern first)")}\n` : "";
+  const shortcuts = `\n${B("Shortcuts")} /transfer1  ${esc("|")}  /transfer3`;
 
   const html = [head,"",line1,line2,line3,line4,baseTitle,body,watchTitle,watchTop,shortcuts].filter(Boolean).join("\n");
-  await sendHTML(env, chatId, html);
+
+  // Inline keyboard: [Refresh] [Full/Simple]
+  const ik = ikTransfer(h, view);
+  if (editMsg?.message_id) {
+    await tg(env,"editMessageText",{chat_id:chatId, message_id:editMsg.message_id, text:html, parse_mode:"HTML", disable_web_page_preview:true, reply_markup:ik});
+  } else {
+    await sendHTML(env, chatId, html, ik);
+  }
 }
 
-/* ---------- Telegram send helper (HTML only) ---------- */
-async function sendHTML(env, chat_id, html){
+/* ---------- Inline keyboard for /transfer ---------- */
+const ikTransfer=(h,view)=>({
+  inline_keyboard:[
+    [
+      {text:"Refresh", callback_data:`xfer:refresh&h=${Math.max(1,Math.min(3,num(h)||1))}&v=${view==="simple"?"simple":"full"}`},
+      {text: view==="full"?"Simple":"Full", callback_data:`xfer:toggle&h=${Math.max(1,Math.min(3,num(h)||1))}&v=${view==="simple"?"simple":"full"}`}
+    ]
+  ]
+});
+
+/* ---------- Telegram helpers ---------- */
+async function sendHTML(env, chat_id, html, reply_markup){
   const p={chat_id, text: html, parse_mode:"HTML", disable_web_page_preview:true};
+  if (reply_markup) p.reply_markup = reply_markup;
   try {
     const r = await tg(env,"sendMessage",p);
     if (!r?.ok) await tg(env,"sendMessage",{chat_id,text:strip(html)});
@@ -319,6 +349,7 @@ const fplFixtures = async(gw)=>{ try{const r=await fetch(`https://fantasy.premie
 
 /* ---------- utils ---------- */
 const cmd = t => !t.startsWith("/") ? {name:"",args:[]} : {name:t.split(/\s+/)[0].slice(1).toLowerCase(), args:t.split(/\s+/).slice(1)};
+const num = v => Number.parseInt(v,10);
 const sellPrice = (p,e) => Number.isFinite(p?.selling_price) ? p.selling_price :
   (Number.isFinite(p?.purchase_price)&&Number.isFinite(e?.now_cost) ? (p.purchase_price + Math.floor(Math.max(0,e.now_cost - p.purchase_price)/2)) :
   (Number.isFinite(e?.now_cost) ? e.now_cost : Number.isFinite(p?.purchase_price) ? p.purchase_price : 0));
