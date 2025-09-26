@@ -1,11 +1,11 @@
 // src/index.js — routes: /start, /link, /unlink, /transfer, /plan[a|b|c|d]
 
-import startCmd     from "./src/commands/start.js";
-import linkCmd      from "./src/commands/link.js";
-import unlinkCmd    from "./src/commands/unlink.js";
-import transferCmd  from "./src/commands/transfer.js";
-import planCmd      from "./src/commands/plan.js";
-import { send }     from "./src/utils/telegram.js";
+import startCmd     from "./commands/start.js";
+import linkCmd      from "./commands/link.js";
+import unlinkCmd    from "./commands/unlink.js";
+import transferCmd  from "./commands/transfer.js";
+import planCmd      from "./commands/plan.js";
+import { send }     from "./utils/telegram.js";
 
 // Worker export
 export default {
