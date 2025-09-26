@@ -1,421 +1,290 @@
-// src/commands/chip.js — Chip Planner (Pro Auto preset)
-// Usage: /chip [h=6]  (h optional; default from preset)
-// Output: BB / TC / FH / WC short recommendations + "why"
+// command/chip.js — Pro Auto (separate) chip advisor
+// Heuristics-only: suggests TC/BB/FH/WC with reasons, using chooseChipAutoConfig.
+// No actions are taken on your team; this is advisory output only.
 
 import { send } from "../utils/telegram.js";
 import { esc }  from "../utils/fmt.js";
-import { chooseAutoConfig } from "../presets.js";
+import { chooseChipAutoConfig } from "../presets.js";
 
-const kUser = (id) => `user:${id}:profile`;
-const B     = (s) => `<b>${esc(s)}</b>`;
-const gbp   = (n) => (n==null ? "—" : `£${Number(n).toFixed(1)}`);
-const posOf = (t) => ({1:"GK",2:"DEF",3:"MID",4:"FWD"})[t] || "?";
+const B = s => `<b>${esc(s)}</b>`;
+const kUser = id => `user:${id}:profile`;
 
-/* -------------------- entry -------------------- */
-export default async function chip(env, chatId, arg="") {
-  // 1) Resolve team
-  const pRaw = env.FPL_BOT_KV ? await env.FPL_BOT_KV.get(kUser(chatId)) : null;
-  const teamId = pRaw ? (JSON.parse(pRaw).teamId) : null;
+export default async function chip(env, chatId) {
+  const raw = env.FPL_BOT_KV ? await env.FPL_BOT_KV.get(kUser(chatId)) : null;
+  const teamId = raw ? (JSON.parse(raw).teamId) : null;
   if (!teamId) {
     await send(env, chatId, `${B("Not linked")} Use /link <TeamID> first.\nExample: /link 1234567`, "HTML");
     return;
   }
 
-  // 2) Pull FPL data
-  const [bootstrap, fixtures, entry] = await Promise.all([
+  // fetch core data
+  const [bootstrap, fixtures, entry, hist, picksCur] = await Promise.all([
     getJSON("https://fantasy.premierleague.com/api/bootstrap-static/"),
     getJSON("https://fantasy.premierleague.com/api/fixtures/"),
-    getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/`)
+    getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/`),
+    getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/history/`),
+    // picks for current GW (we’ll project for next GW but this gives bank/mins hint)
+    (async () => {
+      const curGW = getCurrentGw(await getJSON("https://fantasy.premierleague.com/api/bootstrap-static/"));
+      return curGW ? await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`) : null;
+    })()
   ]);
-  if (!bootstrap || !fixtures || !entry) {
-    await send(env, chatId, "Couldn't fetch FPL data. Try again shortly.");
-    return;
-  }
-  const curGW  = getCurrentGw(bootstrap);
-  const nextGW = getNextGwId(bootstrap);
-  const picks  = await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`);
-  const hist   = await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/history/`);
-  if (!picks) { await send(env, chatId, "Couldn't fetch your picks (is your team private?)."); return; }
 
-  // 3) Config: Pro Auto + optional horizon override
-  let cfg = chooseAutoConfig({ bootstrap, fixtures, picks });
-  const hArg = parseInt((String(arg||"").match(/\bh=(\d+)\b/i)?.[1] || ""), 10);
-  if (Number.isFinite(hArg) && hArg>=3 && hArg<=10) cfg = { ...cfg, chip: { ...cfg.chip }, h: Math.min(cfg.chip.wcHorizon, hArg) };
+  if (!bootstrap || !fixtures || !entry) { await send(env, chatId, "Couldn't fetch FPL data. Try again."); return; }
 
-  // 4) Build weekly projections over horizon
-  const H = cfg.h || cfg.chip.wcHorizon || 6;
-  const weeks = [];
-  for (let gw = nextGW; gw < nextGW + H; gw++) {
-    const wk = projectWeek({ gw, bootstrap, fixtures, picks, minCut: cfg.min, damp: cfg.damp });
-    weeks.push(wk);
-  }
+  const nextGW  = getNextGwId(bootstrap);
+  const curGW   = getCurrentGw(bootstrap);
+  const cfg     = chooseChipAutoConfig({ bootstrap, fixtures, picks: picksCur });
 
-  // 5) Evaluate chip windows
-  const dgwInfo = dgwBlankSummary(fixtures, nextGW, nextGW + H - 1);
-  const bb = adviseBB(weeks, cfg);
-  const tc = adviseTC(weeks, cfg);
-  const fh = adviseFH(weeks, cfg);
-  const wc = adviseWC(weeks, cfg);
+  // chips availability
+  const used = chipUsage(hist);
+  const avail = {
+    "3xc":     used["3xc"] < 1,
+    "bboost":  used["bboost"] < 1,
+    "freehit": used["freehit"] < 1,
+    "wildcard":used["wildcard"] < 2,  // there are two wildcards per season
+  };
 
-  // 6) Header
-  const bank =
-    (typeof picks?.entry_history?.bank === "number") ? picks.entry_history.bank/10 :
-    (typeof entry?.last_deadline_bank === "number") ? entry.last_deadline_bank/10 : 0;
-  const usedThis = (picks?.entry_history?.event_transfers || 0);
-  const nextFT   = usedThis === 0 ? 2 : 1;
+  // element maps
+  const els   = Object.fromEntries((bootstrap?.elements||[]).map(e=>[e.id,e]));
+  const teams = Object.fromEntries((bootstrap?.teams||[]).map(t=>[t.id,t]));
+
+  // your current 15
+  const teamPicks = await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`);
+  if (!teamPicks) { await send(env, chatId, "Couldn't fetch your picks (is your team private?)."); return; }
+  const ownedIds = (teamPicks?.picks||[]).map(p=>p.element);
+  const squadEls = ownedIds.map(id=>els[id]).filter(Boolean);
+
+  // fixture context (DGW/Blank) for next & short horizon
+  const countsNext = gwFixtureCounts(fixtures, nextGW);
+  const isBlankNext = isBlankWeek(countsNext);
+  const isDGWRichNext = Object.values(countsNext).some(c => c > 1);
+
+  // Project next GW XI, bench, and identify captain candidates
+  const nextRows = squadEls.map(el => rowForGw(el, fixtures, nextGW, cfg.min));
+  const gk  = nextRows.filter(r=>r.pos===1).sort(byScore);
+  const def = nextRows.filter(r=>r.pos===2).sort(byScore);
+  const mid = nextRows.filter(r=>r.pos===3).sort(byScore);
+  const fwd = nextRows.filter(r=>r.pos===4).sort(byScore);
+
+  const shapes = [[3,4,3],[3,5,2],[4,4,2],[4,3,3],[4,5,1],[5,3,2],[5,4,1]];
+  const bestXi = pickBestXI(gk,def,mid,fwd,shapes);
+
+  // Baseline (no chip): double captain (best player), no bench points
+  const cap = bestXi?.xi[0] ? bestXi.xi.slice().sort(byScore)[0] : null;
+  const baseNoCap = bestXi?.total || 0;
+  const baseline  = baseNoCap + (cap?.score || 0); // captain adds +1x (from 1x to 2x)
+
+  // ----- Score each chip -----
+  const advice = [];
+
+  // TRIPLE CAPTAIN
+  if (avail["3xc"]) {
+    const capCandidate = cap;
+    const capGain = (capCandidate?.score || 0); // extra over normal captain (2x → 3x)
+    const meetsDGW = (countsNext[capCandidate?.teamId || -1] || 0) > 1;
+    const tcMin = meetsDGW && cfg.tcPreferDGW ? cfg.tcCaptainMinDouble : cfg.tcCaptainMinSingle;
+    const tcOk  = (capCandidate?.score || 0) >= tcMin && (!isBlankNext);
+
+    advice.push({
+      chip: "Triple Captain",
+      available: true,
+      recommend: tcOk,
+      reason: tcOk
+        ? `Captain ${capCandidate?.name} projected ${(capCandidate?.score||0).toFixed(1)} ${meetsDGW?"(DGW)":""}; extra gain ≈ +${capGain.toFixed(1)}.`
+        : `Wait: top captain only ${(capCandidate?.score||0).toFixed(1)}${isBlankNext?" and it’s a blank GW.":""}`,
+      delta: tcOk ? capGain : 0
+    });
+  } else advice.push({ chip:"Triple Captain", available:false, recommend:false, reason:"Already used.", delta:0 });
+
+  // BENCH BOOST
+  if (avail["bboost"]) {
+    const bench = computeBench(nextRows, bestXi?.xi || []);
+    const benchSum = bench.sum;
+    const benchDgwers = bench.rows.filter(r => (countsNext[r.teamId] || 0) > 1).length;
+    const bbBoost = benchDgwers >= 2 ? cfg.bbBenchDgwBoost : 0;
+    const bbOk = (benchSum + bbBoost) >= cfg.bbBenchThreshold && !isBlankNext;
+
+    advice.push({
+      chip: "Bench Boost",
+      available: true,
+      recommend: bbOk,
+      reason: bbOk
+        ? `Bench ≈ ${benchSum.toFixed(1)} pts${benchDgwers>=2?`, +${bbBoost} DGW boost`:''}.`
+        : `Wait: bench only ≈ ${benchSum.toFixed(1)} pts${isBlankNext?" and it’s a blank GW.":""}`,
+      delta: bbOk ? (benchSum + bbBoost) : 0
+    });
+  } else advice.push({ chip:"Bench Boost", available:false, recommend:false, reason:"Already used.", delta:0 });
+
+  // FREE HIT
+  if (avail["freehit"]) {
+    const startersCount = (bestXi?.xi || []).length;
+    const fhStrong = isBlankNext && startersCount < cfg.fhBlankStarterFloor;
+    advice.push({
+      chip: "Free Hit",
+      available: true,
+      recommend: fhStrong,
+      reason: fhStrong
+        ? `Blank GW with only ${startersCount} starters projected.`
+        : (isBlankNext ? `Blank GW but you can field ${startersCount}.` : `Not a blank GW next.`),
+      delta: fhStrong ? Math.max(0, cfg.fhBlankStarterFloor - startersCount) * 2 : 0 // rough proxy
+    });
+  } else advice.push({ chip:"Free Hit", available:false, recommend:false, reason:"Already used.", delta:0 });
+
+  // WILDCARD
+  if (avail["wildcard"]) {
+    const riskyN = riskyStartersCountLike(squadEls, bootstrap, 80);
+    // horizon drop heuristic (compare nextGW XI vs avg of next 3)
+    const horizonAvg = horizonXIAvg(squadEls, fixtures, nextGW, cfg.min, cfg.damp, 3);
+    const drop = Math.max(0, (baseline) - horizonAvg);
+    const wcOk = (riskyN >= cfg.wcRiskyStarterTrigger) || (drop >= cfg.wcLookaheadDrop);
+
+    advice.push({
+      chip: "Wildcard",
+      available: true,
+      recommend: wcOk,
+      reason: wcOk
+        ? riskyN >= cfg.wcRiskyStarterTrigger
+          ? `Many flagged/low-minutes starters (${riskyN}).`
+          : `Projection drops by ≈ ${drop.toFixed(1)} over short horizon.`
+        : `Squad OK: risky starters ${riskyN}, short-horizon drop ${drop.toFixed(1)}.`,
+      delta: wcOk ? (riskyN >= cfg.wcRiskyStarterTrigger ? 4 : 2) : 0 // coarse indicator only
+    });
+  } else advice.push({ chip:"Wildcard", available:false, recommend:false, reason:"Both wildcards used.", delta:0 });
+
+  // Pick top suggested
+  const availableRecs = advice.filter(a => a.available);
+  const best = availableRecs.filter(a => a.recommend).sort((a,b)=>b.delta-a.delta)[0];
 
   const head = [
-    `${B("Team")}: ${esc(entry?.name || "—")} | ${B("GW Horizon")}: ${H} — Chip Planner (Auto Pro)`,
-    `${B("Bank")}: ${gbp(bank)} | ${B("FT (assumed next)")}: ${nextFT} | ${B("Model")}: h=${H}, min=${cfg.min}%, damp=${cfg.damp}`,
-    dgwInfo ? `${B("DGW/Blank")}: ${esc(dgwInfo)}` : ""
-  ].filter(Boolean).join("\n");
+    `${B("Team")}: ${esc(entry?.name || "Team")} | ${B("GW")}: ${nextGW} — Chips Advisor (Pro Auto • separate)`,
+    `${B("Context")}: ${isDGWRichNext?"DGW ":""}${isBlankNext?"Blank ":""}| Captain baseline: ${cap ? `${esc(cap.name)} ${(cap.score||0).toFixed(1)}` : "—"}`
+  ].join("\n");
 
-  // 7) Blocks
-  const lines = [head, ""];
-  lines.push(renderBB(bb));
-  lines.push("");
-  lines.push(renderTC(tc));
-  lines.push("");
-  lines.push(renderFH(fh));
-  lines.push("");
-  lines.push(renderWC(wc));
-  lines.push("");
-  lines.push("Tips: Use /plan to set XI shape per week, and /transfer for targeted upgrades. Add `h=8` to scan further.");
+  const lines = [];
+  for (const a of advice) {
+    const tag = a.recommend ? "✅" : (a.available ? "—" : "✖");
+    lines.push(`${tag} ${B(a.chip)} — ${esc(a.reason)}`);
+  }
+  if (best) lines.push(`\n${B("Recommendation")}: ${best.chip}`);
 
-  await send(env, chatId, lines.join("\n"), "HTML");
+  const html = [head, "", lines.join("\n")].join("\n");
+  await send(env, chatId, html, "HTML");
 }
 
-/* -------------------- advisors -------------------- */
-function adviseBB(weeks, cfg){
-  const ok = weeks
-    .map(w => ({
-      gw: w.gw,
-      benchSafe: w.benchSafe,
-      benchEv: Number(w.benchEv.toFixed(1)),
-      benchLine: w.benchLine,
-      why: [
-        `benchSafe=${w.benchSafe}`,
-        `benchEv=${w.benchEv.toFixed(1)}`
-      ]
-    }))
-    .filter(w => w.benchSafe >= cfg.chip.bbBenchSafeMin && w.benchEv >= cfg.chip.bbBenchEvMin)
-    .sort((a,b)=>b.benchEv - a.benchEv)
-    .slice(0,2);
-  return { top: ok, rule: `Need benchSafe ≥ ${cfg.chip.bbBenchSafeMin} & benchEV ≥ ${cfg.chip.bbBenchEvMin}` };
+/* -------- helpers -------- */
+function chipUsage(hist){
+  const map = { "3xc":0, "bboost":0, "freehit":0, "wildcard":0 };
+  const arr = hist?.chips || [];
+  for (const c of arr) {
+    const name = String(c?.name || "").toLowerCase();
+    if (name in map) map[name] += 1;
+  }
+  return map;
 }
 
-function adviseTC(weeks, cfg){
-  const capEvs = weeks.map(w => w.capEv).filter(x=>Number.isFinite(x) && x>0);
-  const median = capEvs.length ? quantile(capEvs.slice().sort((a,b)=>a-b), 0.5) : 0;
-  const ok = weeks
-    .map(w => ({
-      gw: w.gw,
-      cap: w.capName,
-      capEv: Number(w.capEv.toFixed(1)),
-      spike: Number((w.capEv - median).toFixed(1)),
-      dgw: w.capDGW
-    }))
-    .filter(x => (x.capEv - median) >= cfg.chip.tcSpikeMin || x.capEv >= cfg.chip.tcCapEvMin)
-    .sort((a,b)=> (b.capEv - a.capEv))
-    .slice(0,2);
-  return { top: ok, baseline: median.toFixed(1), rule: `Spike ≥ ${cfg.chip.tcSpikeMin} or CapEV ≥ ${cfg.chip.tcCapEvMin}` };
+function gwFixtureCounts(fixtures, gw){
+  const map={};
+  for (const f of (fixtures||[])){
+    if (f.event !== gw) continue;
+    map[f.team_h] = (map[f.team_h]||0)+1;
+    map[f.team_a] = (map[f.team_a]||0)+1;
+  }
+  return map;
+}
+function isBlankWeek(counts){
+  // blank week if at least one PL team has 0 fixtures and total fixtures are below normal
+  const teamsWithFixture = Object.values(counts).filter(c=>c>0).length;
+  return teamsWithFixture < 20; // typical 20 teams in PL
 }
 
-function adviseFH(weeks, cfg){
-  // Rough “best-of-market” XI vs my XI this week (ignores budget, ok for signal)
-  const ok = [];
-  for (const w of weeks){
-    const gain = Math.max(0, w.marketXiEv - w.xiEv);
-    const pain = (w.starters < 10) || (w.hardInXi >= 7) || (w.riskyXi >= 3);
-    if (gain >= cfg.chip.fhGainMin || pain || w.xiEv < cfg.chip.fhMyEvMin) {
-      ok.push({
-        gw: w.gw,
-        myXi: Number(w.xiEv.toFixed(1)),
-        marketXi: Number(w.marketXiEv.toFixed(1)),
-        gain: Number(gain.toFixed(1)),
-        flags: pain ? flagsForWeek(w) : ""
-      });
+function byScore(a,b){ return (b.score - a.score); }
+
+function computeBench(rows, xi){
+  const xiSet = new Set((xi||[]).map(r=>r.id));
+  const pool = rows.filter(r => !xiSet.has(r.id)).sort(byScore);
+  const field = {
+    outfield: pool.filter(r=>r.pos!==1).slice(0,3),
+    gk: pool.find(r=>r.pos===1) || null
+  };
+  const benchRows = [...field.outfield, ...(field.gk?[field.gk]:[])];
+  const sum = benchRows.reduce((s,r)=>s+(r.score||0), 0);
+  return { rows: benchRows, sum };
+}
+
+function pickBestXI(gk,def,mid,fwd,shapes){
+  const take=(a,n)=>a.slice(0,Math.min(n,a.length));
+  let best=null;
+  for (const [D,M,F] of shapes){
+    if (!gk.length) continue;
+    const g = gk[0], ds=take(def,D), ms=take(mid,M), fs=take(fwd,F);
+    if (ds.length<D || ms.length<M || fs.length<F) continue;
+    const xi=[g,...ds,...ms,...fs];
+    const total=xi.reduce((s,r)=>s+(r.score||0),0);
+    if (!best || total>best.total) best={ xi, total };
+  }
+  return best;
+}
+
+function rowForGw(el, fixtures, gw, minCut=78){
+  const mp = chance(el); if (mp < minCut) return makeRow(el, 0);
+  const ppg = parseFloat(el.points_per_game || "0") || 0;
+  const fs = fixtures.filter(f=>f.event===gw && (f.team_h===el.team || f.team_a===el.team))
+                     .sort((a,b)=>((a.kickoff_time||"")<(b.kickoff_time||""))?-1:1);
+  if (!fs.length) return makeRow(el, 0);
+  let score=0;
+  fs.forEach((f,idx)=>{
+    const home = f.team_h===el.team;
+    const fdr  = home ? (f.team_h_difficulty ?? f.difficulty ?? 3) : (f.team_a_difficulty ?? f.difficulty ?? 3);
+    const mult = fdrMult(fdr);
+    const damp = idx===0 ? 1.0 : 0.94;
+    score += ppg * (mp/100) * mult * damp;
+  });
+  return makeRow(el, score);
+}
+function makeRow(el, s){
+  return { id:el.id, name: (el.web_name||"—"), pos: el.element_type, teamId: el.team, score: s };
+}
+function chance(el){ const v=parseInt(el?.chance_of_playing_next_round ?? "100",10); return Number.isFinite(v)?Math.max(0,Math.min(100,v)):100; }
+function fdrMult(fdr){ const x=Math.max(2,Math.min(5,Number(fdr)||3)); return 1.30 - 0.10*x; }
+
+function horizonXIAvg(squadEls, fixtures, startGw, minCut, damp, H=3){
+  // crude: average best-XI projection over startGw...startGw+H-1
+  let tot=0, n=0;
+  for (let g=startGw; g<startGw+H; g++){
+    const rows = squadEls.map(el => rowForGw(el, fixtures, g, minCut));
+    const gk  = rows.filter(r=>r.pos===1).sort(byScore);
+    const def = rows.filter(r=>r.pos===2).sort(byScore);
+    const mid = rows.filter(r=>r.pos===3).sort(byScore);
+    const fwd = rows.filter(r=>r.pos===4).sort(byScore);
+    const shapes = [[3,4,3],[3,5,2],[4,4,2],[4,3,3],[4,5,1],[5,3,2],[5,4,1]];
+    const xi = pickBestXI(gk,def,mid,fwd,shapes);
+    if (xi) {
+      const cap = xi.xi.slice().sort(byScore)[0];
+      const baseline = xi.total + (cap?.score || 0); // include normal captain
+      tot += baseline; n++;
     }
   }
-  ok.sort((a,b)=> (b.gain - a.gain) || (b.marketXi - a.marketXi));
-  return { top: ok.slice(0,1), rule: `Gain ≥ ${cfg.chip.fhGainMin} or starters<10 / hard fixtures / risky XI` };
+  return n ? (tot/n) : 0;
 }
 
-function adviseWC(weeks, cfg){
-  // Average next 3 weeks if available
-  const take = weeks.slice(0, Math.min(3, weeks.length));
-  const avgMy   = take.reduce((s,w)=>s+w.xiEv,0) / Math.max(1,take.length);
-  const avgMkt  = take.reduce((s,w)=>s+w.marketXiEv,0) / Math.max(1,take.length);
-  const stress  = weeks.length ? Math.max(...weeks.map(w=>w.stress)) : 0;
-  const gain    = avgMkt - avgMy;
-  const suggest = (gain >= cfg.chip.wcGainMin) && (stress >= cfg.chip.wcStressMin);
-
-  // pick the week with highest stress as the window
-  const worst = weeks.slice().sort((a,b)=>b.stress - a.stress)[0];
-
-  return {
-    suggest,
-    window: worst ? { gw: worst.gw, stress: worst.stress } : null,
-    gain: Number(gain.toFixed(1)),
-    rule: `Avg gain ≥ ${cfg.chip.wcGainMin} & stress ≥ ${cfg.chip.wcStressMin}`
-  };
-}
-
-/* -------------------- renderers -------------------- */
-function renderBB(bb){
-  const lines = [];
-  lines.push(`${B("Bench Boost")}`);
-  if (!bb.top.length) {
-    lines.push(`• No strong window. (${esc(bb.rule)})`);
-    return lines.join("\n");
-  }
-  bb.top.forEach(w=>{
-    lines.push(`• GW${w.gw} — BenchEV ${w.benchEv} | ${w.benchLine}`);
-  });
-  lines.push(`Why: ${esc(bb.rule)}`);
-  return lines.join("\n");
-}
-function renderTC(tc){
-  const lines = [];
-  lines.push(`${B("Triple Captain")}`);
-  if (!tc.top.length) {
-    lines.push(`• No standout spike. (baseline CapEV ${tc.baseline})`);
-    return lines.join("\n");
-  }
-  tc.top.forEach(w=>{
-    const tag = w.dgw ? " (DGW)" : "";
-    lines.push(`• GW${w.gw} — ${esc(w.cap)}${tag} | CapEV ${w.capEv} | Spike +${w.spike}`);
-  });
-  lines.push(`Why: baseline ${tc.baseline}, rule: ${esc(tc.rule)}`);
-  return lines.join("\n");
-}
-function renderFH(fh){
-  const lines = [];
-  lines.push(`${B("Free Hit")}`);
-  if (!fh.top.length) {
-    lines.push("• Hold FH for now.");
-    return lines.join("\n");
-  }
-  const w = fh.top[0];
-  lines.push(`• GW${w.gw} — EV gain +${w.gain} (my ${w.myXi} → market ${w.marketXi})${w.flags?` | ${w.flags}`:""}`);
-  lines.push(`Why: ${esc(fh.rule)}`);
-  return lines.join("\n");
-}
-function renderWC(wc){
-  const lines = [];
-  lines.push(`${B("Wildcard")}`);
-  if (!wc.suggest || !wc.window) {
-    lines.push(`• No urgent WC signal. (Avg gain +${wc.gain}, rule: ${esc(wc.rule)})`);
-    return lines.join("\n");
-  }
-  lines.push(`• Consider GW${wc.window.gw} — stress ${wc.window.stress} | projected avg gain +${wc.gain}`);
-  lines.push(`Why: ${esc(wc.rule)}`);
-  return lines.join("\n");
-}
-
-/* -------------------- projections -------------------- */
-function projectWeek({ gw, bootstrap, fixtures, picks, minCut=85, damp=0.94 }){
-  const els = Object.fromEntries((bootstrap?.elements||[]).map(e=>[e.id,e]));
-  const teams = Object.fromEntries((bootstrap?.teams||[]).map(t=>[t.id,t]));
-  const all = (picks?.picks||[]).map(p=>els[p.element]).filter(Boolean);
-
-  // score every squad player for this GW
-  const rows = all.map(el => rowForGw(el, fixtures, gw, minCut, damp));
-
-  // Best XI (legal shapes)
-  const best = bestXI(rows);
-
-  // Bench EV (top 3 outfield + backup GK)
-  const pool = rows.slice().sort((a,b)=>b.ev-a.ev);
-  const byType = (t) => pool.filter(r=>r.type===t);
-  const gks    = byType(1);
-  const outs   = pool.filter(r=>r.type!==1);
-  const bench3 = outs.filter(r=>!best.xi.find(x=>x.id===r.id)).slice(0,3);
-  const bGk    = gks.find(r=>!best.xi.find(x=>x.id===r.id));
-  const benchEv = bench3.reduce((s,r)=>s+r.ev,0) + (bGk?.ev || 0);
-  const benchSafe = bench3.filter(r=>r.hasFixture && r.min>=minCut).length + ((bGk && bGk.hasFixture && bGk.min>=minCut)?1:0);
-  const benchLine = [
-    bench3[0] ? `1) ${bench3[0].name} (${bench3[0].pos})` : null,
-    bench3[1] ? `2) ${bench3[1].name} (${bench3[1].pos})` : null,
-    bench3[2] ? `3) ${bench3[2].name} (${bench3[2].pos})` : null,
-    bGk       ? `GK) ${bGk.name}` : null
-  ].filter(Boolean).join(", ");
-
-  // Captain EV & DGW tag
-  const cap = best.xi.slice().sort((a,b)=>b.ev-a.ev)[0];
-  const capName = cap ? cap.name : "—";
-  const capEv   = cap ? cap.ev : 0;
-  const capDGW  = cap ? cap.double>1 : false;
-
-  // Hard fixtures count & risky XI count
-  const hardInXi = best.xi.filter(r => (r.avgFdr ?? 3) >= 4.5).length;
-  const riskyXi  = best.xi.filter(r => (!r.hasFixture || r.min < minCut)).length;
-
-  // Market (rough best XI this week, from all players)
-  const marketPool = (bootstrap?.elements||[])
-    .map(el => rowForGw(el, fixtures, gw, minCut, damp))
-    .filter(r => r.hasFixture && r.min>=minCut);
-  const marketBest = bestXI(marketPool);
-  const starters = best.xi.filter(r=>r.hasFixture && r.min>=minCut).length;
-
-  // Stress
-  const stress = (riskyXi*3) + Math.max(0, 8 - hardInXi) + Math.max(0, 4 - benchSafe);
-
-  return {
-    gw,
-    xiEv: sumEv(best.xi),
-    marketXiEv: sumEv(marketBest.xi),
-    starters,
-    hardInXi,
-    riskyXi,
-    benchEv,
-    benchSafe,
-    benchLine,
-    capName, capEv, capDGW,
-    stress
-  };
-}
-
-function bestXI(rows){
-  const shapes = [[3,4,3],[3,5,2],[4,4,2],[4,3,3],[4,5,1],[5,3,2],[5,4,1]];
-  const type = (t)=>rows.filter(r=>r.type===t).slice().sort((a,b)=>b.ev-a.ev);
-  const G=type(1), D=type(2), M=type(3), F=type(4);
-  let best=null;
-
-  const pickGK = ()=> G.length ? G[0] : null;
-  function pickN(arr, n){
-    const ok = arr.filter(r=>r.hasFixture).slice(0,n);
-    if (ok.length===n) return ok;
-    // if not enough with fixture, allow next best (rare)
-    const more = arr.filter(r=>!ok.find(x=>x.id===r.id)).slice(0, n-ok.length);
-    return [...ok, ...more];
-  }
-
-  for (const [d,m,f] of shapes){
-    const gk = pickGK(); if(!gk) continue;
-    const ds = pickN(D, d); if (ds.length<d) continue;
-    const ms = pickN(M, m); if (ms.length<m) continue;
-    const fs = pickN(F, f); if (fs.length<f) continue;
-    const xi = [gk, ...ds, ...ms, ...fs];
-    const ev = sumEv(xi);
-    if (!best || ev>best.ev) best = { xi, ev };
-  }
-  return best || { xi: [], ev: 0 };
-}
-
-function rowForGw(el, fixtures, gw, minCut=85, damp=0.94){
-  const min = chance(el);
-  const name = shortName(el);
-  const pos  = posOf(el.element_type);
-
-  const games = fixtures
-    .filter(f => f.event===gw && (f.team_h===el.team || f.team_a===el.team))
-    .sort((a,b)=> ((a.kickoff_time||"")<(b.kickoff_time||""))?-1:1);
-
-  if (min < minCut || games.length===0) {
-    return { id: el.id, name, pos, type: el.element_type, min, ev: 0, hasFixture: games.length>0, avgFdr: games.length? avgFdrFor(el, games) : null, double: games.length };
-  }
-
-  let ev=0;
-  games.forEach((g, idx)=>{
-    const fdr = fdrFor(el, g);
-    const mult = fdrMult(fdr);
-    const dampK = idx===0 ? 1.0 : damp;
-    const ppg = parseFloat(el.points_per_game || "0") || 0;
-    ev += ppg * (min/100) * mult * dampK;
-  });
-
-  return {
-    id: el.id, name, pos, type: el.element_type, min,
-    ev,
-    hasFixture: true,
-    avgFdr: avgFdrFor(el, games),
-    double: games.length
-  };
-}
-
-/* -------------------- helpers -------------------- */
 function getCurrentGw(bootstrap){
-  const ev=bootstrap?.events??[];
-  const cur=ev.find(e=>e.is_current); if(cur) return cur.id;
-  const nxt=ev.find(e=>e.is_next); if(nxt) return nxt.id;
+  const ev=bootstrap?.events||[];
+  const cur=ev.find(e=>e.is_current); if (cur) return cur.id;
+  const nxt=ev.find(e=>e.is_next);    if (nxt) return nxt.id;
   const up=ev.find(e=>!e.finished);
   return up ? up.id : (ev[ev.length-1]?.id||1);
 }
 function getNextGwId(bootstrap){
-  const ev=bootstrap?.events??[];
-  const nxt=ev.find(e=>e.is_next); if(nxt) return nxt.id;
+  const ev=bootstrap?.events||[];
+  const nxt=ev.find(e=>e.is_next); if (nxt) return nxt.id;
   const cur=ev.find(e=>e.is_current);
-  if(cur){
-    const i=ev.findIndex(x=>x.id===cur.id);
-    return ev[i+1]?.id || cur.id;
-  }
+  if (cur){ const i=ev.findIndex(x=>x.id===cur.id); return ev[i+1]?.id || cur.id; }
   const up=ev.find(e=>!e.finished);
   return up ? up.id : (ev[ev.length-1]?.id||1);
 }
-function fdrFor(el, f){
-  const home = f.team_h===el.team;
-  return home ? (f.team_h_difficulty ?? f.difficulty ?? 3)
-              : (f.team_a_difficulty ?? f.difficulty ?? 3);
-}
-function avgFdrFor(el, games){
-  let s=0; for (const g of games) s += fdrFor(el,g); return s/games.length;
-}
-function fdrMult(fdr){
-  const x = Math.max(2, Math.min(5, Number(fdr)||3));
-  return 1.30 - 0.10 * x; // easy → ~1.10, hard → ~0.80
-}
-function chance(el){
-  const v = parseInt(el?.chance_of_playing_next_round ?? "100", 10);
-  return Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : 100;
-}
-function shortName(el){
-  const first = (el?.first_name||"").trim();
-  const last  = (el?.second_name||"").trim();
-  const web   = (el?.web_name||"").trim();
-  if (first && last) {
-    const initLast = `${first[0]}. ${last}`;
-    return (web && web.length <= initLast.length) ? web : initLast;
-  }
-  return web || last || first || "—";
-}
-function sumEv(arr){ return arr.reduce((s,r)=>s+(r.ev||0),0); }
-function quantile(sortedAsc, q){
-  if (!sortedAsc.length) return 0;
-  const pos = (sortedAsc.length - 1) * q;
-  const base = Math.floor(pos);
-  const rest = pos - base;
-  if (sortedAsc[base+1]!==undefined) return sortedAsc[base] + rest*(sortedAsc[base+1]-sortedAsc[base]);
-  return sortedAsc[base];
-}
-function flagsForWeek(w){
-  const f = [];
-  if (w.starters < 10) f.push("starters<10");
-  if (w.hardInXi >= 7) f.push("hard fixtures");
-  if (w.riskyXi >= 3) f.push("risky XI");
-  return f.join(", ");
-}
-function dgwBlankSummary(fixtures, fromGw, toGw){
-  const map = {};
-  for (const f of (fixtures||[])) {
-    const g = f.event; if (!g || g<fromGw || g>toGw) continue;
-    map[g] = map[g] || { dgw:0, blank:0, teams:{} };
-    map[g].teams[f.team_h] = (map[g].teams[f.team_h]||0)+1;
-    map[g].teams[f.team_a] = (map[g].teams[f.team_a]||0)+1;
-  }
-  const parts=[];
-  for (const gw of Object.keys(map).map(n=>+n).sort((a,b)=>a-b)){
-    const t = map[gw].teams;
-    const d = Object.values(t).filter(c=>c>1).length;
-    const b = Object.values(t).filter(c=>c===0).length; // always 0 in this map; kept for completeness
-    if (d>0) parts.push(`GW${gw}: ${d} DGW teams`);
-  }
-  return parts.join(" • ");
-}
 async function getJSON(url){
-  try{
-    const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
-    if (!r.ok) return null;
-    return await r.json().catch(()=>null);
+  try { const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+        if (!r.ok) return null; return await r.json().catch(()=>null);
   } catch { return null; }
 }
