@@ -1,3 +1,4 @@
+// src/commands/transfer.js
 import { send } from "../utils/telegram.js";
 import { esc } from "../utils/fmt.js";
 
@@ -54,6 +55,8 @@ export default async function transfer(env, chatId) {
   const startersP = (picks?.picks || []).filter(p => (p.position || 16) <= 11);
   const benchP    = (picks?.picks || []).filter(p => (p.position || 16) > 11);
   const allPicks  = (picks?.picks || []);
+  const ownedIds  = new Set(allPicks.map(p => p.element)); // NEW: full-squad ownership check
+
   const teamCounts = {}; // current team usage
   for (const p of allPicks) {
     const el = els[p.element]; if (!el) continue;
@@ -116,8 +119,11 @@ export default async function transfer(env, chatId) {
     for (let i=0; i<list.length && singles.length<400; i++) {
       const IN = list[i];
       if (IN.id === out.id) continue;
+      if (ownedIds.has(IN.id)) continue; // NEW: skip if already owned anywhere in squad
+
       const priceDiff = IN.price - out.sell;
       if (priceDiff > bank) continue; // budget
+
       // team cap (handle swap in same team)
       const newCountIn = (teamCounts[IN.teamId] || 0) + (IN.teamId === out.teamId ? 0 : 1);
       if (newCountIn > MAX_PER_TEAM) continue;
@@ -169,7 +175,8 @@ export default async function transfer(env, chatId) {
     "• Minutes from chance_of_playing_next_round (fallback 100%).",
     "• FDR_mult from fixture difficulty (harder → lower).",
     "• Swaps keep same position → formation stays legal; team limit ≤3; budget respected.",
-    "• Net = ΔScore − 4×(moves − 1 FT)."
+    "• Net = ΔScore − 4×(moves − 1 FT).",
+    "• Dedup: IN candidates already owned are skipped."
   ].join("\n");
 
   await send(env, chatId, html, "HTML");
@@ -192,12 +199,8 @@ function renderPlan(title, plan){
 }
 
 /* ---------------- helpers: combos ---------------- */
-function bestCombo(singles, K, allPicks, els, MAX_PER_TEAM, bank, teamCounts, FT_NEXT){
+function bestCombo(singles, K, _allPicks, _els, MAX_PER_TEAM, bank, teamCounts, FT_NEXT){
   if (!singles.length || K < 2) return { moves: [], delta: 0, hit: 0, net: 0 };
-  // prune by position buckets so we don't pick conflicting outs
-  // simple combinations generator with validity checks
-  const outsInUse = new Set();
-  const combos = [];
 
   function validCombo(combo){
     const outIds = new Set(), inIds = new Set();
@@ -219,11 +222,9 @@ function bestCombo(singles, K, allPicks, els, MAX_PER_TEAM, bank, teamCounts, FT
     return { delta: deltaSum, hit, net: deltaSum - hit, spend };
   }
 
-  // limit search space: try first ~60 singles, then combine
   const S = Math.min(60, singles.length);
   const base = singles.slice(0, S);
 
-  // K=2 or 3
   if (K === 2) {
     let best = null;
     for (let i=0;i<S;i++){
@@ -252,16 +253,13 @@ function bestCombo(singles, K, allPicks, els, MAX_PER_TEAM, bank, teamCounts, FT
 }
 
 /* ---------------- helpers: scoring ---------------- */
-// minutes % (fallback 100)
 function chance(el){
   const v = parseInt(el?.chance_of_playing_next_round ?? "100", 10);
   return Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : 100;
 }
 function teamShort(teams, id){ return teams[id]?.short_name || "?"; }
 
-// One-week projection: sum per-fixture score; damp 2nd game to 0.9
 function rowForNextGW(el, fixtures, teams, gw){
-  // fixtures for this team in GW
   const fs = fixtures.filter(f => f.event === gw && (f.team_h===el.team || f.team_a===el.team));
   if (!fs.length) return { score: 0 };
   const minX = chance(el)/100;
@@ -271,12 +269,11 @@ function rowForNextGW(el, fixtures, teams, gw){
     const fdr  = home ? (f.team_h_difficulty ?? f.difficulty ?? 3) : (f.team_a_difficulty ?? f.difficulty ?? 3);
     const mult = fdrMult(fdr);
     const ppg  = parseFloat(el.points_per_game || "0") || 0;
-    const damp = idx === 0 ? 1.0 : 0.9; // mild damp for the second DGW match
+    const damp = idx === 0 ? 1.0 : 0.9; // mild damp for second DGW match
     total += (ppg * mult * minX) * damp;
   });
   return { score: total };
 }
-// FDR multiplier: base 1.30 − 0.10×clamp(FDR,2..5)  ->  FDR 2 ≈ 1.10, FDR 3 ≈ 1.00, FDR 5 ≈ 0.80
 function fdrMult(fdr){
   const x = Math.max(2, Math.min(5, Number(fdr)||3));
   return 1.30 - 0.10 * x;
