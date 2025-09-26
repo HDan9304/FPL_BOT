@@ -1,50 +1,75 @@
-// worker.js (compact; /transfer adds Bench + fixtures with DGW/Blank + optional horizon)
-export default{async fetch(req,env){const u=new URL(req.url),p=u.pathname.replace(/\/$/,"");if(req.method==="GET"&&(p===""||p==="/"))return x("OK");if(req.method==="GET"&&p==="/init-webhook"){const r=await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`,{method:"POST",headers:{"content-type":"application/json; charset=utf-8"},body:JSON.stringify({url:`${u.origin}/webhook/telegram`,secret_token:env.TELEGRAM_WEBHOOK_SECRET,allowed_updates:["message"],drop_pending_updates:true})});const j=await r.json().catch(()=>({}));return x(j?.ok?"webhook set":`failed: ${j?.description||"unknown"}`,j?.ok?200:500)}if(p==="/webhook/telegram"){if(req.method!=="POST")return x("Method Not Allowed",405);if(req.headers.get("x-telegram-bot-api-secret-token")!==env.TELEGRAM_WEBHOOK_SECRET)return x("Forbidden",403);let up;try{up=await req.json()}catch{return x("Bad Request",400)}const m=up?.message,cid=m?.chat?.id,t=(m?.text||"").trim();if(!cid)return x("ok");await env.FPL_BOT_KV.put(K.last(cid),String(Date.now()));const c=cmd(t);switch(c.name){case"start":await handleStart(env,m);break;case"linkteam":await handleLinkTeam(env,m,c.args);break;case"myteam":await handleMyTeam(env,m);break;case"transfer":await handleTransfer(env,m,c.args);break;default:break}return x("ok")}return x("Not Found",404)}};
-const x=(s,st=200)=>new Response(s,{status:st,headers:{"content-type":"text/plain; charset=utf-8"}});
+// worker.js (compact; inline buttons only, with callback_query support)
+export default{async fetch(req,env){const u=new URL(req.url),p=u.pathname.replace(/\/$/,"");if(req.method==="GET"&&(p===""||p==="/"))return R("OK");if(req.method==="GET"&&p==="/init-webhook"){const r=await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`,{method:"POST",headers:{"content-type":"application/json; charset=utf-8"},body:JSON.stringify({url:`${u.origin}/webhook/telegram`,secret_token:env.TELEGRAM_WEBHOOK_SECRET,allowed_updates:["message","callback_query"],drop_pending_updates:true})});const j=await r.json().catch(()=>({}));return R(j?.ok?"webhook set":`failed: ${j?.description||"unknown"}`,j?.ok?200:500)}
+if(p==="/webhook/telegram"){if(req.method!=="POST")return R("Method Not Allowed",405);if(req.headers.get("x-telegram-bot-api-secret-token")!==env.TELEGRAM_WEBHOOK_SECRET)return R("Forbidden",403);let u2;try{u2=await req.json()}catch{return R("Bad Request",400)}
+const msg=u2?.message,cq=u2?.callback_query;
+if(msg){const chatId=msg?.chat?.id;const t=(msg?.text||"").trim();if(!chatId)return R("ok");await env.FPL_BOT_KV.put(K.last(chatId),String(Date.now()));const c=cmd(t);switch(c.name){case"start":await handleStart(env,msg.chat.id,msg.from);break;case"linkteam":await handleLinkTeam(env,msg.chat.id,c.args);break;case"myteam":await handleMyTeam(env,msg.chat.id);break;case"transfer":await handleTransfer(env,msg.chat.id,c.args);break;default:await handleStart(env,msg.chat.id,msg.from);break}return R("ok")}
+if(cq){const chatId=cq?.message?.chat?.id;const data=cq?.data||"";if(!chatId)return R("ok");await env.FPL_BOT_KV.put(K.last(chatId),String(Date.now()));await tg(env,"answerCallbackQuery",{callback_query_id:cq.id});const [act,param]=data.split(":");switch(act){case"start":await handleStart(env,chatId,cq.from);break;case"myteam":await handleMyTeam(env,chatId);break;case"transfer":await handleTransfer(env,chatId,[param||"1"]);break;case"linkhelp":await handleLinkTeam(env,chatId,[]);break;default:break}return R("ok")}
+return R("ok")}return R("Not Found",404)}};
+const R=(s,st=200)=>new Response(s,{status:st,headers:{"content-type":"text/plain; charset=utf-8"}});
 
-/* ---------- commands ---------- */
-async function handleStart(env,m){const id=m.chat.id,f=ascii((m.from?.first_name||"there").trim());const html=[`<b>${esc(`Hey ${f}!`)}</b>`,"",esc("I show a clean, current-GW overview of your FPL squad."),"",`${B("Link Team")} <code>/linkteam &lt;YourTeamID&gt;</code>`,"",`${B("My Team (Current GW)")} <code>/myteam</code>`,"",`${B("Transfers (Next GW)")} <code>/transfer</code>`].join("\n");await sendHTML(env,id,html,keys())}
+/* ---------- commands (inline keyboards only) ---------- */
+async function handleStart(env,chatId,from){const f=ascii((from?.first_name||"there").trim());const html=[`<b>${esc(`Hey ${f}!`)}</b>`,"",esc("I use inline buttons only. Explore:"),"",`${B("Link Team")} <code>/linkteam &lt;YourTeamID&gt;</code>`,"",`${B("Shortcuts")} below ⬇️`].join("\n");await sendHTML(env,chatId,html,ikHome())}
 
-async function handleLinkTeam(env,m,args){const id=m.chat.id,raw=(args[0]||"").trim();if(!raw){const g=[`<b>${esc("Link Your FPL Team")}</b>`,"",`${B("Where To Find Team ID")} ${esc("Open fantasy.premierleague.com -> My Team")}`,`${esc("Look at the URL:")} <code>/entry/1234567/</code> ${esc("- that's your ID")}`,"",B("How To Link"),`<pre><code>/linkteam 1234567</code></pre>`].join("\n");return sendHTML(env,id,g,keys())}const tid=Number(raw);if(!Number.isInteger(tid)||tid<=0)return sendHTML(env,id,`${B("Tip")} ${esc("Use a numeric ID, e.g.")} <code>/linkteam 1234567</code>`,keys());const ent=await fplEntry(tid);if(!ent)return sendHTML(env,id,`${B("Not Found")} ${esc("That team ID didn’t resolve. Double-check and try again.")}`,keys());const now=Date.now();await env.FPL_BOT_KV.put(K.user(id),JSON.stringify({teamId:tid,createdAt:now,updatedAt:now}));const tname=ascii(`${ent.name||"Team"}`),mgr=ascii(`${ent.player_first_name||""} ${ent.player_last_name||""}`.trim());const html=[`<b>${esc("Team Linked")}</b> ✅`,"",`${B("Team")} <b>${esc(tname)}</b>`,mgr?`${B("Manager")} ${esc(mgr)}`:"",`${B("Team ID")} ${esc(String(tid))}`,"",`${B("Next")} <code>/myteam</code> ${esc("(current GW)")}`].filter(Boolean).join("\n");await sendHTML(env,id,html,keys())}
+async function handleLinkTeam(env,chatId,args){const raw=(args[0]||"").trim();if(!raw){const g=[`<b>${esc("Link Your FPL Team")}</b>`,"",`${B("Where To Find Team ID")} ${esc("fantasy.premierleague.com → My Team")}`,`${esc("URL example:")} <code>/entry/1234567/</code>`,`${esc("Your link command:")}`,"<pre><code>/linkteam 1234567</code></pre>"].join("\n");return sendHTML(env,chatId,g,ikHome())}
+const tid=Number(raw);if(!Number.isInteger(tid)||tid<=0)return sendHTML(env,chatId,`${B("Tip")} ${esc("Use a numeric ID, e.g.")} <code>/linkteam 1234567</code>`,ikHome());
+const ent=await fplEntry(tid);if(!ent)return sendHTML(env,chatId,`${B("Not Found")} ${esc("That team ID didn’t resolve. Double-check and try again.")}`,ikHome());const now=Date.now();
+await env.FPL_BOT_KV.put(K.user(chatId),JSON.stringify({teamId:tid,createdAt:now,updatedAt:now}));
+const tname=ascii(`${ent.name||"Team"}`),mgr=ascii(`${ent.player_first_name||""} ${ent.player_last_name||""}`.trim());
+const html=[`<b>${esc("Team Linked")}</b> ✅`,"",`${B("Team")} <b>${esc(tname)}</b>`,mgr?`${B("Manager")} ${esc(mgr)}`:"",`${B("Team ID")} ${esc(String(tid))}`,"",`${B("Next")} use the buttons below ⬇️`].filter(Boolean).join("\n");
+await sendHTML(env,chatId,html,ikHome())}
 
-async function handleMyTeam(env,m){const id=m.chat.id,prof=await env.FPL_BOT_KV.get(K.user(id)).then(j=>j&&JSON.parse(j)).catch(()=>null),tid=prof?.teamId;if(!tid)return sendHTML(env,id,[`${B("No Team Linked")} ${esc("Add your team first:")}`,"",`<code>/linkteam &lt;YourTeamID&gt;</code>`].join("\n"),keys());const boot=await bootStatic();if(!boot)return sendHTML(env,id,`${B("Busy")} ${esc("FPL is busy. Try again shortly.")}`,keys());const ev=boot.events||[],els=boot.elements||[],tms=boot.teams||[],el=new Map(els.map(e=>[e.id,e])),abbr=i=>(tms.find(x=>x.id===i)?.short_name||""),pos=t=>({1:"GK",2:"DEF",3:"MID",4:"FWD"}[t]||"");const cur=ev.find(e=>e.is_current)||ev.filter(e=>e.finished).sort((a,b)=>b.id-a.id)[0]||null;if(!cur)return sendHTML(env,id,`${B("Oops")} ${esc("Couldn't determine the current gameweek.")}`,keys());const gw=cur.id;const [entry,hist,picks,live]=await Promise.all([fplEntry(tid),fplEntryHistory(tid),fplEntryPicks(tid,gw),fplEventLive(gw)]);if(!entry||!hist||!picks||!live)return sendHTML(env,id,`${B("Error")} ${esc("Couldn't load your team right now.")}`,keys());const row=(hist.current||[]).find(r=>r.event===gw),pts=row?.points??null,rank=row?.overall_rank??row?.rank??null,val=row?.value??hist?.current?.slice(-1)?.[0]?.value??entry?.value??null,bank=row?.bank??hist?.current?.slice(-1)?.[0]?.bank??entry?.bank??null;const arr=(picks.picks||[]).slice().sort((a,b)=>a.position-b.position),XI=arr.filter(p=>p.position<=11),BN=arr.filter(p=>p.position>=12);const liveMap=new Map();(live.elements||[]).forEach(e=>{let bonus=0,mins=0;if(Array.isArray(e.explain))for(const ex of e.explain)for(const st of(ex.stats||[])){if(st.identifier==="bonus")bonus+=(st.points||0);if(st.identifier==="minutes")mins+=(st.value||0)}if(typeof e.stats?.bonus==="number")bonus=e.stats.bonus;if(typeof e.stats?.minutes==="number")mins=e.stats.minutes;liveMap.set(e.id,{total:e.stats?.total_points??0,bonus,minutes:mins})});const C=XI.find(p=>p.is_captain)?.element,VC=arr.find(p=>p.is_vice_captain)?.element;const grp={GK:[],DEF:[],MID:[],FWD:[]},line=p=>{const e=el.get(p.element);if(!e)return null;const L=liveMap.get(p.element)||{total:0,bonus:0},name=`${e.web_name}`,club=abbr(e.team),ps=pos(e.element_type),mul=p.multiplier||0,isC=p.element===C,isVC=p.element===VC,raw=L.total,bon=L.bonus>0?` (+${L.bonus} bonus)`:"",mulN=mul===0?" (bench)":(mul===1?"":` (x${mul}=${raw*mul})`),tag=isC?" (C)":(isVC?" (VC)":"");return `${esc(`${name}${tag}`)} ${esc(`(${club}, ${ps})`)} ${esc(String(raw))}${esc(bon)}${esc(mulN)}`};for(const p of XI){const e=el.get(p.element);if(!e)continue;const ps=pos(e.element_type),ln=line(p);if(!ln)continue;if(ps==="GK")grp.GK.push(ln);else if(ps==="DEF")grp.DEF.push(ln);else if(ps==="MID")grp.MID.push(ln);else grp.FWD.push(ln)}const bnLines=BN.map(line).filter(Boolean);const act=picks.active_chip||null,played=(hist.chips||[]).map(c=>c.name),avail=remainingChips(played),subs=simulateAutosubs(XI,BN,liveMap,el);const tn=ascii(`${entry.name||"Team"}`),money=v=>typeof v==="number"?(v/10).toFixed(1):"-",fmt=n=>typeof n==="number"?n.toLocaleString("en-GB"):"-";const head=`<b>${esc(tn)}</b>\n${esc(`Gameweek ${gw} (current)`)}`,sum1=pipes([F("Points",pts!=null?String(pts):"-"),F("Overall Rank",rank!=null?fmt(rank):"-"),F("Team Value",money(val)),F("Bank",money(bank))]),sum2=pipes([F("Captain",C?(el.get(C)?.web_name||""):"—"),F("Vice-Captain",VC?(el.get(VC)?.web_name||""):"—"),F("Active Chip",act?niceChip(act):"None")]);const XIblk=[section("GK",grp.GK),section("DEF",grp.DEF),section("MID",grp.MID),section("FWD",grp.FWD)].filter(Boolean).join("\n"),BNblk=bnLines.length?section("Bench",bnLines):"",ASblk=subs.length?section("Auto-subs (projected)",subs.map(s=>esc(`${s.outName} (${s.outPos}) -> ${s.inName} (${s.inPos})`))):"",chips=`${B("Available Chips")} ${esc((avail.join(", ")||"None").trim())}`;const html=[head,"",sum1,sum2,"","",XIblk,BNblk,ASblk,chips].filter(Boolean).join("\n");await sendHTML(env,id,html,keys())}
+async function handleMyTeam(env,chatId){const prof=await env.FPL_BOT_KV.get(K.user(chatId)).then(j=>j&&JSON.parse(j)).catch(()=>null),tid=prof?.teamId;
+if(!tid)return sendHTML(env,chatId,[`${B("No Team Linked")} ${esc("Add your team first:")}`,"",`<code>/linkteam &lt;YourTeamID&gt;</code>`].join("\n"),ikHome());
+const boot=await bootStatic();if(!boot)return sendHTML(env,chatId,`${B("Busy")} ${esc("FPL is busy. Try again shortly.")}`,ikHome());
+const ev=boot.events||[],els=boot.elements||[],tms=boot.teams||[],el=new Map(els.map(e=>[e.id,e])),abbr=i=>(tms.find(x=>x.id===i)?.short_name||""),pos=t=>({1:"GK",2:"DEF",3:"MID",4:"FWD"}[t]||"");
+const cur=ev.find(e=>e.is_current)||ev.filter(e=>e.finished).sort((a,b)=>b.id-a.id)[0]||null;if(!cur)return sendHTML(env,chatId,`${B("Oops")} ${esc("Couldn't determine the current gameweek.")}`,ikHome());
+const gw=cur.id;const [entry,hist,picks,live]=await Promise.all([fplEntry(tid),fplEntryHistory(tid),fplEntryPicks(tid,gw),fplEventLive(gw)]);
+if(!entry||!hist||!picks||!live)return sendHTML(env,chatId,`${B("Error")} ${esc("Couldn't load your team right now.")}`,ikHome());
+const row=(hist.current||[]).find(r=>r.event===gw),pts=row?.points??null,rank=row?.overall_rank??row?.rank??null,val=row?.value??hist?.current?.slice(-1)?.[0]?.value??entry?.value??null,bank=row?.bank??hist?.current?.slice(-1)?.[0]?.bank??entry?.bank??null;
+const arr=(picks.picks||[]).slice().sort((a,b)=>a.position-b.position),XI=arr.filter(p=>p.position<=11),BN=arr.filter(p=>p.position>=12);
+const liveMap=new Map();(live.elements||[]).forEach(e=>{let bonus=0,mins=0;if(Array.isArray(e.explain))for(const ex of e.explain)for(const st of(ex.stats||[])){if(st.identifier==="bonus")bonus+=(st.points||0);if(st.identifier==="minutes")mins+=(st.value||0)}if(typeof e.stats?.bonus==="number")bonus=e.stats.bonus;if(typeof e.stats?.minutes==="number")mins=e.stats.minutes;liveMap.set(e.id,{total:e.stats?.total_points??0,bonus,minutes:mins})});
+const C=XI.find(p=>p.is_captain)?.element,VC=arr.find(p=>p.is_vice_captain)?.element,abbrT=i=>(tms.find(x=>x.id===i)?.short_name||"");
+const group={GK:[],DEF:[],MID:[],FWD:[]},posName=t=>({1:"GK",2:"DEF",3:"MID",4:"FWD"}[t]||"");
+const line=p=>{const e=el.get(p.element);if(!e)return null;const L=liveMap.get(p.element)||{total:0,bonus:0},raw=L.total,bon=L.bonus>0?` (+${L.bonus} bonus)`:"",mul=p.multiplier||0,tag=p.element===C?" (C)":(p.element===VC?" (VC)":"");const mulN=mul===0?" (bench)":(mul===1?"":` (x${mul}=${raw*mul})`);return `${esc(`${e.web_name}${tag}`)} ${esc(`(${abbrT(e.team)}, ${posName(e.element_type)})`)} ${esc(String(raw))}${esc(bon)}${esc(mulN)}`};
+for(const p of XI){const e=el.get(p.element);if(!e)continue;const ln=line(p);if(!ln)continue;const ps=posName(e.element_type);if(ps==="GK")group.GK.push(ln);else if(ps==="DEF")group.DEF.push(ln);else if(ps==="MID")group.MID.push(ln);else group.FWD.push(ln)}
+const bn=BN.map(line).filter(Boolean);
+const tn=ascii(`${entry.name||"Team"}`),money=v=>typeof v==="number"?(v/10).toFixed(1):"-",fmt=n=>typeof n==="number"?n.toLocaleString("en-GB"):"-";
+const head=`<b>${esc(tn)}</b>\n${esc(`Gameweek ${gw} (current)`)}`;
+const sum1=pipes([F("Points",pts!=null?String(pts):"-"),F("Overall Rank",rank!=null?fmt(rank):"-"),F("Team Value",money(val)),F("Bank",money(bank))]);
+const sum2=pipes([F("Captain",C?(el.get(C)?.web_name||""):"—"),F("Vice-Captain",VC?(el.get(VC)?.web_name||""):"—")]);
+const XIblk=[section("GK",group.GK),section("DEF",group.DEF),section("MID",group.MID),section("FWD",group.FWD)].filter(Boolean).join("\n");
+const BNblk=bn.length?section("Bench",bn):"";
+const html=[head,"",sum1,sum2,"","",XIblk,BNblk].filter(Boolean).join("\n");
+await sendHTML(env,chatId,html,ikHome())}
 
-async function handleTransfer(env,m,args){
-  const id=m.chat.id,prof=await env.FPL_BOT_KV.get(K.user(id)).then(j=>j&&JSON.parse(j)).catch(()=>null),tid=prof?.teamId;
-  if(!tid)return sendHTML(env,id,[`${B("No Team Linked")} ${esc("Add your team first:")}`,"",`<code>/linkteam &lt;YourTeamID&gt;</code>`].join("\n"),keys());
-  const boot=await bootStatic(); if(!boot)return sendHTML(env,id,`${B("Busy")} ${esc("FPL is busy. Try again shortly.")}`,keys());
-  const ev=boot.events||[],els=boot.elements||[],tms=boot.teams||[],elMap=new Map(els.map(e=>[e.id,e]));
-  const abbr=i=>(tms.find(x=>x.id===i)?.short_name||""),pos=t=>({1:"GK",2:"DEF",3:"MID",4:"FWD"}[t]||"");
-  const cur=ev.find(e=>e.is_current)||ev.filter(e=>e.finished).sort((a,b)=>b.id-a.id)[0]||null;
-  const next=ev.find(e=>e.is_next)||((cur&&ev.find(e=>e.id===cur.id+1))||null);
-  const curId=cur?.id,nextId=next?.id||(curId?curId+1:null); if(!curId||!nextId) return sendHTML(env,id,`${B("Oops")} ${esc("Can't resolve next gameweek yet.")}`,keys());
+async function handleTransfer(env,chatId,args){
+  const prof=await env.FPL_BOT_KV.get(K.user(chatId)).then(j=>j&&JSON.parse(j)).catch(()=>null),tid=prof?.teamId;
+  if(!tid)return sendHTML(env,chatId,[`${B("No Team Linked")} ${esc("Add your team first:")}`,"",`<code>/linkteam &lt;YourTeamID&gt;</code>`].join("\n"),ikHome());
+  const boot=await bootStatic(); if(!boot)return sendHTML(env,chatId,`${B("Busy")} ${esc("FPL is busy. Try again shortly.")}`,ikHome());
+  const ev=boot.events||[],els=boot.elements||[],tms=boot.teams||[],elMap=new Map(els.map(e=>[e.id,e])),abbr=i=>(tms.find(x=>x.id===i)?.short_name||""),pos=t=>({1:"GK",2:"DEF",3:"MID",4:"FWD"}[t]||"");
+  const cur=ev.find(e=>e.is_current)||ev.filter(e=>e.finished).sort((a,b)=>b.id-a.id)[0]||null;const next=ev.find(e=>e.is_next)||((cur&&ev.find(e=>e.id===cur.id+1))||null);
+  const curId=cur?.id,nextId=next?.id||(curId?curId+1:null); if(!curId||!nextId) return sendHTML(env,chatId,`${B("Oops")} ${esc("Can't resolve next gameweek yet.")}`,ikHome());
   const dlRaw=next?.deadline_time||null,dlMs=dlRaw?new Date(dlRaw).getTime():null,beforeDL=dlMs?Date.now()<dlMs:false;
-
-  // horizon: /transfer 1|2|3  (default 1 -> only next GW per-player, N+1/N+2 shown as extra lines if requested)
   const horizon=Math.max(1,Math.min(3,parseInt((args?.[0]||"1"),10)||1));
 
-  // picks & base squad (Free Hit → revert)
   const curPicks=await fplEntryPicks(tid,curId),prevPicks=(curId>1)?await fplEntryPicks(tid,curId-1):null;
   const activeChip=curPicks?.active_chip||null,base=(activeChip==="freehit"&&prevPicks?.picks?.length)?prevPicks:curPicks;
   const bank=curPicks?.entry_history?.bank??0,usedThisGW=curPicks?.entry_history?.event_transfers??0,ftNext=(beforeDL&&usedThisGW===0)?2:1;
 
-  // fixtures map per GW -> team -> array of {oppId,home,diff}
-  const fixMap=new Map(); const makeKey=(gw,tid)=>`${gw}:${tid}`;
+  // fixtures map
+  const fixMap=new Map(), key=(gw,tid)=>`${gw}:${tid}`;
   for(let g=0;g<horizon;g++){const gw=nextId+g;const fx=await fplFixtures(gw);if(!fx)continue;
     for(const f of fx){const H={oppId:f.team_a,home:true,diff:f.team_h_difficulty},A={oppId:f.team_h,home:false,diff:f.team_a_difficulty};
-      const hk=makeKey(gw,f.team_h),ak=makeKey(gw,f.team_a);
+      const hk=key(gw,f.team_h),ak=key(gw,f.team_a);
       (fixMap.get(hk)||fixMap.set(hk,[]).get(hk)).push(H);
       (fixMap.get(ak)||fixMap.set(ak,[]).get(ak)).push(A);
     }
   }
-  const fmtFixtures=(teamId,gw)=>{const arr=fixMap.get(makeKey(gw,teamId))||[];if(arr.length===0)return "BLANK";if(arr.length>1)return "DGW: "+arr.map(a=>`${abbr(a.oppId)} (${a.home?"H":"A"},${a.diff})`).join(" | ");const a=arr[0];return `${abbr(a.oppId)} (${a.home?"H":"A"},${a.diff})`};
+  const fmtF=(teamId,gw)=>{const a=fixMap.get(key(gw,teamId))||[];if(a.length===0)return "BLANK";if(a.length>1)return "DGW: "+a.map(v=>`${abbr(v.oppId)} (${v.home?"H":"A"},${v.diff})`).join(" | ");const v=a[0];return `${abbr(v.oppId)} (${v.home?"H":"A"},${v.diff})`};
 
-  // build bullets for XI + BENCH with selling prices and fixtures for N (+ horizon)
   const picks=(base?.picks||[]).slice().sort((a,b)=>a.position-b.position),XI=picks.filter(p=>p.position<=11),BN=picks.filter(p=>p.position>=12);
-  const mkLine=(p)=>{const e=elMap.get(p.element);if(!e)return null;const sp=sellPrice(p,e),baseTxt=`${e.web_name} (${abbr(e.team)}, ${pos(e.element_type)}) £${(sp/10).toFixed(1)} sell`,n=`${fmtFixtures(e.team,nextId)}`;let tail=` — ${n}`;if(horizon>1){const n1=fmtFixtures(e.team,nextId+1);tail+=`\n   +1: ${n1}`}if(horizon>2){const n2=fmtFixtures(e.team,nextId+2);tail+=`\n   +2: ${n2}`}return esc(baseTxt+tail)};
-  const groups={GK:[],DEF:[],MID:[],FWD:[]},bench=[];
-  for(const p of XI){const e=elMap.get(p.element);if(!e)continue;const ln=mkLine(p);if(!ln)continue;const t=e.element_type;if(t===1)groups.GK.push(ln);else if(t===2)groups.DEF.push(ln);else if(t===3)groups.MID.push(ln);else groups.FWD.push(ln)}
-  for(const p of BN){const ln=mkLine(p);if(ln)bench.push(ln)}
+  const mk=(p)=>{const e=elMap.get(p.element);if(!e)return null;const sp=sellPrice(p,e);let s=`${e.web_name} (${abbr(e.team)}, ${pos(e.element_type)}) £${(sp/10).toFixed(1)} sell — ${fmtF(e.team,nextId)}`;if(horizon>1)s+=`\n   +1: ${fmtF(e.team,nextId+1)}`;if(horizon>2)s+=`\n   +2: ${fmtF(e.team,nextId+2)}`;return esc(s)};
+  const G={GK:[],DEF:[],MID:[],FWD:[]},Bench=[];for(const p of XI){const e=elMap.get(p.element);if(!e)continue;const ln=mk(p);if(!ln)continue;const t=e.element_type;if(t===1)G.GK.push(ln);else if(t===2)G.DEF.push(ln);else if(t===3)G.MID.push(ln);else G.FWD.push(ln)}for(const p of BN){const ln=mk(p);if(ln)Bench.push(ln)}
 
   const fmtUTC=d=>{const z=n=>String(n).padStart(2,"0");return `${d.getUTCFullYear()}-${z(d.getUTCMonth()+1)}-${z(d.getUTCDate())} ${z(d.getUTCHours())}:${z(d.getUTCMinutes())} UTC`};
   const countdown=ms=>{if(ms<=0)return "deadline passed";const d=Math.floor(ms/864e5),h=Math.floor(ms%864e5/36e5),m=Math.floor(ms%36e5/6e4);return `${d}d ${h}h ${m}m`};
@@ -65,23 +90,37 @@ async function handleTransfer(env,m,args){
   const bullets=s=>s.map(v=>`• ${v}`).join("\n");
   const baseTitle=`\n${B("Base Squad")} ${esc("(selling prices)")}\n`;
   const body=[
-    `${B("GK")} \n${bullets(groups.GK)}`,
-    `\n${B("DEF")} \n${bullets(groups.DEF)}`,
-    `\n${B("MID")} \n${bullets(groups.MID)}`,
-    `\n${B("FWD")} \n${bullets(groups.FWD)}`,
-    `\n${B("Bench")} \n${bullets(bench)}`
+    `${B("GK")} \n${bullets(G.GK)}`,
+    `\n${B("DEF")} \n${bullets(G.DEF)}`,
+    `\n${B("MID")} \n${bullets(G.MID)}`,
+    `\n${B("FWD")} \n${bullets(G.FWD)}`,
+    `\n${B("Bench")} \n${bullets(Bench)}`
   ].join("\n\n");
 
   const html=[head,"",line1,line2,line3,line4,baseTitle,body].filter(Boolean).join("\n");
-  await sendHTML(env,id,html,keys())
+  await sendHTML(env,chatId,html,ikTransfer(horizon))
 }
 
-/* ---------- Telegram ---------- */
-const keys=()=>({keyboard:[[{text:"/myteam"},{text:"/linkteam"}],[{text:"/transfer 1"},{text:"/transfer 3"}]],resize_keyboard:true,one_time_keyboard:false});
-async function sendHTML(env,chat_id,html,reply){const p={chat_id,text:html,parse_mode:"HTML",disable_web_page_preview:true};if(reply)p.reply_markup=reply;const r=await tg(env,"sendMessage",p);if(r?.ok)return;const p2={chat_id,text:strip(html),disable_web_page_preview:true};if(reply)p2.reply_markup=reply;await tg(env,"sendMessage",p2)}
+/* ---------- Inline keyboards ---------- */
+const ikHome=()=>({inline_keyboard:[
+  [{text:"My Team",callback_data:"myteam"},{text:"Transfer (GW+1)",callback_data:"transfer:1"}],
+  [{text:"Transfer (GW+1..+3)",callback_data:"transfer:3"}],
+  [{text:"Link Team Guide",callback_data:"linkhelp"}],
+  [{text:"Open FPL",url:"https://fantasy.premierleague.com/"}]
+]});
+const ikTransfer=h=>({inline_keyboard:[
+  [{text:"Refresh",callback_data:`transfer:${Math.max(1,Math.min(3,Number(h)||1))}`}],
+  [{text:"Horizon: 1",callback_data:"transfer:1"},{text:"Horizon: 3",callback_data:"transfer:3"}],
+  [{text:"My Team",callback_data:"myteam"},{text:"Home",callback_data:"start"}],
+  [{text:"Open FPL",url:"https://fantasy.premierleague.com/"}]
+]});
+
+/* ---------- Telegram send helper (HTML only) ---------- */
+async function sendHTML(env,chat_id,html,inline){const p={chat_id,text:html,parse_mode:"HTML",disable_web_page_preview:true};if(inline)p.reply_markup=inline;try{const r=await tg(env,"sendMessage",p);if(!r?.ok){await tg(env,"sendMessage",{chat_id,text:strip(html)})}}catch{await tg(env,"sendMessage",{chat_id,text:strip(html)})}
+}
 async function tg(env,meth,payload){try{const r=await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${meth}`,{method:"POST",headers:{"content-type":"application/json; charset=utf-8"},body:JSON.stringify(payload)});return await r.json()}catch{return{ok:false}}}
 
-/* ---------- FPL ---------- */
+/* ---------- FPL API ---------- */
 const bootStatic=async()=>{try{const r=await fetch("https://fantasy.premierleague.com/api/bootstrap-static/",{cf:{cacheTtl:60}});if(!r.ok)return null;return await r.json().catch(()=>null)}catch{return null}};
 const fplEntry=async(id)=>{try{const r=await fetch(`https://fantasy.premierleague.com/api/entry/${id}/`,{cf:{cacheTtl:0}});if(!r.ok)return null;const j=await r.json().catch(()=>null);if(!j||(j.id!==id&&typeof j.id!=="number"))return null;return j}catch{return null}};
 const fplEntryHistory=async(id)=>{try{const r=await fetch(`https://fantasy.premierleague.com/api/entry/${id}/history/`,{cf:{cacheTtl:0}});if(!r.ok)return null;return await r.json().catch(()=>null)}catch{return null}};
@@ -91,12 +130,11 @@ const fplFixtures=async(gw)=>{try{const r=await fetch(`https://fantasy.premierle
 
 /* ---------- utils ---------- */
 const cmd=t=>!t.startsWith("/")?{name:"",args:[]}:{name:t.split(/\s+/)[0].slice(1).toLowerCase(),args:t.split(/\s+/).slice(1)};
-const remainingChips=played=>{const c={wildcard:0,freehit:0,bench_boost:0,triple_captain:0};for(const n of played)if(n in c)c[n]++;const out=[],wc=Math.max(0,2-c.wildcard);if(wc>0)out.push("Wildcard");if(c.freehit===0)out.push("Free Hit");if(c.bench_boost===0)out.push("Bench Boost");if(c.triple_captain===0)out.push("Triple Captain");return out};
-const niceChip=n=>({freehit:"Free Hit",bench_boost:"Bench Boost",triple_captain:"Triple Captain",wildcard:"Wildcard"}[n]||n);
-// selling price: prefer API; else buy + floor((now-buy)/2); fallback to now/buy/0  (all tenths)
 const sellPrice=(p,e)=>Number.isFinite(p?.selling_price)?p.selling_price:
   (Number.isFinite(p?.purchase_price)&&Number.isFinite(e?.now_cost)?(p.purchase_price+Math.floor(Math.max(0,e.now_cost-p.purchase_price)/2)):
   (Number.isFinite(e?.now_cost)?e.now_cost:Number.isFinite(p?.purchase_price)?p.purchase_price:0));
+const remainingChips=played=>{const c={wildcard:0,freehit:0,bench_boost:0,triple_captain:0};for(const n of played)if(n in c)c[n]++;const out=[],wc=Math.max(0,2-c.wildcard);if(wc>0)out.push("Wildcard");if(c.freehit===0)out.push("Free Hit");if(c.bench_boost===0)out.push("Bench Boost");if(c.triple_captain===0)out.push("Triple Captain");return out};
+const niceChip=n=>({freehit:"Free Hit",bench_boost:"Bench Boost",triple_captain:"Triple Captain",wildcard:"Wildcard"}[n]||n);
 function simulateAutosubs(XI,BN,live,el){const pos=id=>({1:"GK",2:"DEF",3:"MID",4:"FWD"}[el.get(id)?.element_type]||""),mins=id=>live.get(id)?.minutes||0,ct={GK:0,DEF:0,MID:0,FWD:0};for(const p of XI)ct[pos(p.element)]++;const zeroGK=XI.find(p=>pos(p.element)==="GK"&&mins(p.element)===0)||null,zeroOut=XI.filter(p=>pos(p.element)!=="GK"&&mins(p.element)===0),out=[],used=new Set();const bGK=BN.find(p=>pos(p.element)==="GK");if(zeroGK&&bGK&&mins(bGK.element)>0){out.push({outId:zeroGK.element,inId:bGK.element,outPos:"GK",inPos:"GK",outName:el.get(zeroGK.element)?.web_name||"",inName:el.get(bGK.element)?.web_name||""});used.add(bGK.element)}const need={DEF:3,MID:2,FWD:1},B=BN.filter(p=>pos(p.element)!=="GK");for(const bp of B){if(used.has(bp.element))continue;if(mins(bp.element)<=0)continue;const bP=pos(bp.element);for(let i=0;i<zeroOut.length;i++){const sp=zeroOut[i],sP=pos(sp.element),c={...ct};c[sP]--;c[bP]++;if(c.DEF>=need.DEF&&c.MID>=need.MID&&c.FWD>=need.FWD){ct[sP]--;ct[bP]++;out.push({outId:sp.element,inId:bp.element,outPos:sP,inPos:bP,outName:el.get(sp.element)?.web_name||"",inName:el.get(bp.element)?.web_name||""});zeroOut.splice(i,1);used.add(bp.element);break}}}return out}
 const section=(lab,lines)=>lines.length?([`${B(lab)}`,...lines,""].join("\n")):"";
 const ascii=s=>String(s).replace(/[‘’]/g,"'").replace(/[“”]/g,'"').replace(/\u2014|\u2013/g,"-").replace(/\u00A0/g," ");
