@@ -1,4 +1,4 @@
-// worker.js — commands only (no keyboards), /transfer adds Priority Watchlist for weak picks
+// worker.js — commands only (no keyboards), /transfer adds Priority Watchlist + tappable /transfer1 | /transfer3 shortcuts
 
 export default {
   async fetch(req, env) {
@@ -35,11 +35,14 @@ export default {
 
         const c = cmd(t);
         switch (c.name) {
-          case "start": await handleStart(env, chatId, msg.from); break;
-          case "linkteam": await handleLinkTeam(env, chatId, c.args); break;
-          case "myteam": await handleMyTeam(env, chatId); break;
-          case "transfer": await handleTransfer(env, chatId, c.args); break;
-          default: await handleStart(env, chatId, msg.from); break;
+          case "start":       await handleStart(env, chatId, msg.from); break;
+          case "linkteam":    await handleLinkTeam(env, chatId, c.args); break;
+          case "myteam":      await handleMyTeam(env, chatId); break;
+          case "transfer":    await handleTransfer(env, chatId, c.args); break;
+          case "transfer1":   await handleTransfer(env, chatId, ["1"]); break;
+          case "transfer3":   await handleTransfer(env, chatId, ["3"]); break;
+          case "tranfer3":    await handleTransfer(env, chatId, ["3"]); break; // typo-safe
+          default:            await handleStart(env, chatId, msg.from); break;
         }
       }
       return R("ok");
@@ -190,7 +193,7 @@ async function handleTransfer(env, chatId, args){
     if(a.length>1) return "DGW: "+a.map(v=>`${abbr(v.oppId)} (${v.home?"H":"A"},${v.diff})`).join(" | ");
     const v=a[0]; return `${abbr(v.oppId)} (${v.home?"H":"A"},${v.diff})`;
   };
-  const tough=(teamId,gw)=>{const a=fixMap.get(key(gw,teamId))||[];if(a.length===0)return {label:"BLANK",isBlank:true,isTough:false};const toughAny=a.some(v=>v.diff>=4);return {label:fmtF(teamId,gw),isBlank:false,isTough:toughAny,isDGW:a.length>1}};
+  const tough=(teamId,gw)=>{const a=fixMap.get(key(gw,teamId))||[];if(a.length===0)return {label:"BLANK",isBlank:true,isTough:false,isDGW:false};const tAny=a.some(v=>v.diff>=4);return {label:fmtF(teamId,gw),isBlank:false,isTough:tAny,isDGW:a.length>1}};
 
   // Build Base Squad groups with fixtures
   const picks=(base?.picks||[]).slice().sort((a,b)=>a.position-b.position), XI=picks.filter(p=>p.position<=11), BN=picks.filter(p=>p.position>=12);
@@ -218,8 +221,7 @@ async function handleTransfer(env, chatId, args){
     const blankFlag=N.isBlank;                                                 // blank in N
     const toughN=N.isTough;                                                    // difficulty >=4 in N
     const toughN1=N1?N1.isTough:false;                                        // difficulty >=4 in N+1
-    const dgwGood=N.isDGW && !toughN;                                         // DGW but not tough → not a negative
-    // price-drop heuristic: large net transfers out and no fall yet this event
+    const dgwGood=N.isDGW && !toughN;                                         // DGW but not tough → soften
     const netOut=(e.transfers_out_event||0)-(e.transfers_in_event||0);
     const dropRisk=(netOut>20000)&&((e.cost_change_event_fall||0)===0);
 
@@ -230,7 +232,7 @@ async function handleTransfer(env, chatId, args){
     if(toughN)    score+=25;
     if(toughN1)   score+=10;
     if(dropRisk)  score+=10;
-    if(dgwGood)   score-=10; // soften if DGW & not tough
+    if(dgwGood)   score-=10;
 
     const flags=[];
     if(blankFlag) flags.push("BLANK");
@@ -282,7 +284,9 @@ async function handleTransfer(env, chatId, args){
   ].join("\n\n");
 
   const watchTitle = watchTop ? `\n${B("Priority Watchlist (GW N)")} ${esc("(highest concern first)")}\n` : "";
-  const html = [head,"",line1,line2,line3,line4,baseTitle,body,watchTitle,watchTop].filter(Boolean).join("\n");
+  const shortcuts = `\n${B("Shortcuts")} /transfer1  ${esc("|")}  /transfer3`; // tappable commands to refresh
+
+  const html = [head,"",line1,line2,line3,line4,baseTitle,body,watchTitle,watchTop,shortcuts].filter(Boolean).join("\n");
   await sendHTML(env, chatId, html);
 }
 
