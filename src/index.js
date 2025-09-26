@@ -1,5 +1,5 @@
 import startCmd from "./commands/start.js";
-import transferCmd from "./commands/transfer.js";
+import linkCmd from "./commands/link.js";
 import { parseCmd } from "./utils/fmt.js";
 
 export default {
@@ -7,6 +7,7 @@ export default {
     const url = new URL(req.url);
     const path = url.pathname.replace(/\/$/, "");
 
+    // Health
     if (req.method === "GET" && (path === "" || path === "/"))
       return new Response("OK", { headers: { "content-type": "text/plain; charset=utf-8" } });
 
@@ -35,19 +36,15 @@ export default {
       if (req.headers.get("x-telegram-bot-api-secret-token") !== env.TELEGRAM_WEBHOOK_SECRET)
         return new Response("Forbidden", { status: 403 });
 
-      let update;
-      try { update = await req.json(); } catch { return new Response("Bad Request", { status: 400 }); }
-
-      const msg = update?.message;
-      const chatId = msg?.chat?.id;
-      const raw = (msg?.text || "").trim();
+      let update; try { update = await req.json(); } catch { return new Response("Bad Request", { status: 400 }); }
+      const msg = update?.message; const chatId = msg?.chat?.id;
       if (!chatId) return new Response("ok");
 
+      const raw = (msg?.text || "").trim();
       const { name } = parseCmd(raw);
 
-      if (name === "transfer") { await transferCmd(env, chatId); return new Response("ok"); }
-
-      await startCmd(env, chatId, msg); // default to /start
+      if (name === "link") { await linkCmd(env, chatId, msg); return new Response("ok"); }
+      await startCmd(env, chatId, msg); // default
       return new Response("ok");
     }
 
