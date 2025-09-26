@@ -1,6 +1,9 @@
 import { send } from "../utils/telegram.js";
 import { esc, B } from "../utils/fmt.js";
-import { getBootstrap, getCurrentGw, getEntry, getPicks, nameShort, teamShort, posName } from "../utils/fpl.js";
+import {
+  getBootstrap, getCurrentGw, getEntry, getPicks,
+  nameShort, teamShort, posName
+} from "../utils/fpl.js";
 
 const kUser = (id) => `user:${id}:profile`;
 
@@ -29,7 +32,7 @@ export default async function link(env, chatId, msg) {
   }
 
   // Fetch FPL data
-  const [bootstrap, entry] = await Promise.all([ getBootstrap(), getEntry(teamId) ]);
+  const [bootstrap, entry] = await Promise.all([getBootstrap(), getEntry(teamId)]);
   if (!entry) {
     await send(env, chatId, `${B("Not Found")} that Team ID didn’t resolve. Double-check or make your team public.`, "HTML");
     return;
@@ -40,39 +43,40 @@ export default async function link(env, chatId, msg) {
   // Save to KV
   const now = Date.now();
   try {
-    await env.FPL_BOT_KV.put(kUser(chatId), JSON.stringify({ teamId, createdAt: now, updatedAt: now }), { expirationTtl: 60*60*24*365 });
+    await env.FPL_BOT_KV.put(
+      kUser(chatId),
+      JSON.stringify({ teamId, createdAt: now, updatedAt: now }),
+      { expirationTtl: 60 * 60 * 24 * 365 }
+    );
   } catch {}
 
   // Build output
   const teamName = entry?.name || "—";
   const manager = [entry?.player_first_name, entry?.player_last_name].filter(Boolean).join(" ") || "—";
-
-  // Overall rank & GW points
-  // Prefer picks.entry_history.event_points; OVR from entry.summary_overall_rank (fallbacks handled)
   const gwPoints = picks?.entry_history?.points ?? picks?.entry_history?.event_points ?? "—";
   const overallRank = entry?.summary_overall_rank ?? entry?.overall_rank ?? "—";
 
-  // Map helpers
   const byId = Object.fromEntries((bootstrap?.elements || []).map(e => [e.id, e]));
-  const starters = (picks?.picks || []).filter(p => (p.position||16) <= 11);
-  const bench    = (picks?.picks || []).filter(p => (p.position||16) > 11).sort((a,b)=>a.position-b.position);
-  const isC  = new Set(starters.filter(p=>p.is_captain).map(p=>p.element));
-  const isVC = new Set(starters.filter(p=>p.is_vice_captain).map(p=>p.element));
+  const starters = (picks?.picks || []).filter(p => (p.position || 16) <= 11);
+  const bench    = (picks?.picks || []).filter(p => (p.position || 16) > 11).sort((a, b) => a.position - b.position);
+  const isC  = new Set(starters.filter(p => p.is_captain).map(p => p.element));
+  const isVC = new Set(starters.filter(p => p.is_vice_captain).map(p => p.element));
 
   const tag = (el) => isC.has(el.id) ? " (C)" : isVC.has(el.id) ? " (VC)" : "";
   const pEl = (p) => byId[p.element];
 
-  // Grouped XI lines
-  const group = (type) => starters.map(pEl).filter(el => el && el.element_type === type)
-    .map(el => `• ${esc(nameShort(el))} (${esc(teamShort(bootstrap, el.team))})${esc(tag(el))}`)
-    .join("\n") || "• —";
+  // Grouped XI lines with short names
+  const group = (type) =>
+    starters.map(pEl).filter(el => el && el.element_type === type)
+      .map(el => `• ${esc(nameShort(el))} (${esc(teamShort(bootstrap, el.team))})${esc(tag(el))}`)
+      .join("\n") || "• —";
 
   const GK = group(1);
   const DF = group(2);
   const MD = group(3);
   const FW = group(4);
 
-  // Bench lines: first three non-GK as 1/2/3, then GK
+  // Bench lines: 1/2/3 outfield then GK
   const benchOut = bench.filter(p => pEl(p)?.element_type !== 1);
   const benchGk  = bench.find(p => pEl(p)?.element_type === 1);
   const benchLines = [];
