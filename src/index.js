@@ -5,6 +5,7 @@
 import startCmd from "./commands/start.js";
 import linkCmd from "./commands/link.js";
 import unlinkCmd from "./commands/unlink.js";
+import transferCmd from "./commands/transfer.js";
 
 function text(s, status = 200) {
   return new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
@@ -25,7 +26,7 @@ export default {
     // health
     if (req.method === "GET" && (path === "" || path === "/")) return text("OK");
 
-    // register webhook (unchanged)
+    // register webhook
     if (req.method === "GET" && path === "/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method: "POST",
@@ -39,24 +40,6 @@ export default {
       });
       const j = await r.json().catch(() => ({}));
       return text(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, j?.ok ? 200 : 500);
-    }
-
-    // NEW: register tappable commands in Telegram client
-    if (req.method === "GET" && path === "/init-commands") {
-      const payload = {
-        commands: [
-          { command: "start",  description: "Show help & how to link" },
-          { command: "link",   description: "Link your FPL team (e.g. /link 1234567)" },
-          { command: "unlink", description: "Forget the saved team" }
-        ]
-      };
-      const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setMyCommands`, {
-        method: "POST",
-        headers: { "content-type": "application/json; charset=utf-8" },
-        body: JSON.stringify(payload)
-      });
-      const j = await r.json().catch(() => ({}));
-      return text(j?.ok ? "commands set" : `failed: ${j?.description || "unknown"}`, j?.ok ? 200 : 500);
     }
 
     // webhook
@@ -74,6 +57,7 @@ export default {
       if (name === "start" || name === "") { await startCmd(env, chatId, msg.from); return text("OK"); }
       if (name === "link"  || name === "linkteam") { await linkCmd(env, chatId, msg); return text("OK"); }
       if (name === "unlink") { await unlinkCmd(env, chatId); return text("OK"); }
+      if (name === "transfer" || name === "transfers") { await transferCmd(env, chatId); return text("OK"); }
 
       await startCmd(env, chatId, msg.from); // fallback
       return text("OK");
