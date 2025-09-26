@@ -10,7 +10,7 @@ export default {
     // Health
     if (req.method === "GET" && (path === "" || path === "/")) return text("OK");
 
-    // One-click webhook init
+    // Webhook init helper
     if (req.method === "GET" && path === "/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method: "POST",
@@ -63,7 +63,7 @@ async function handleStart(env, msg) {
   const html = [
     `<b>${htmlEsc(`Hey ${first}!`)}</b>`,
     ``,
-    htmlEsc(`I help you view clean, current gameweek info for your FPL team.`),
+    htmlEsc(`I show a clean, current-GW overview of your FPL squad.`),
     ``,
     `${boldLabel("Link Team")} <code>/linkteam &lt;YourTeamID&gt;</code>`,
     ``,
@@ -82,9 +82,10 @@ async function handleLinkTeam(env, msg, args) {
       `<b>${htmlEsc("Link Your FPL Team")}</b>`,
       ``,
       `${boldLabel("Where To Find Team ID")} ${htmlEsc("Open fantasy.premierleague.com → My Team")}`,
-      `${htmlEsc("Look at the URL: it shows")} <code>/entry/1234567/</code> ${htmlEsc("- that's your ID")}`,
+      `${htmlEsc("Look at the URL:")} <code>/entry/1234567/</code> ${htmlEsc("- that's your ID")}`,
       ``,
-      `${boldLabel("How To Link")} <pre><code>/linkteam 1234567</code></pre>`
+      `${boldLabel("How To Link")}`,
+      `<pre><code>/linkteam 1234567</code></pre>`
     ].join("\n");
     await sendHTML(env, chatId, guide, keyboardMain());
     return;
@@ -135,23 +136,36 @@ async function handleMyTeam(env, msg) {
     return;
   }
 
-  // Bootstrap for current event + player names
+  // Bootstrap (current event + elements & teams)
   const boot = await fplBootstrap();
   if (!boot) { await sendHTML(env, chatId, `${boldLabel("Busy")} ${htmlEsc("FPL is busy. Try again shortly.")}`, keyboardMain()); return; }
 
-  const currentEvent = (boot.events || []).find(e => e.is_current)
-                    || (boot.events || []).filter(e => e.finished).sort((a,b)=>b.id-a.id)[0]
+  const events = boot.events || [];
+  const elements = boot.elements || [];
+  const teams = boot.teams || [];
+  const elById = new Map(elements.map(e => [e.id, e]));
+  const teamShort = (teamIdNum) => {
+    const t = teams.find(x => x.id === teamIdNum);
+    return t ? t.short_name : "";
+  };
+
+  const currentEvent = events.find(e => e.is_current)
+                    || events.filter(e => e.finished).sort((a,b)=>b.id-a.id)[0]
                     || null;
   if (!currentEvent) { await sendHTML(env, chatId, `${boldLabel("Oops")} ${htmlEsc("Couldn't determine the current gameweek.")}`, keyboardMain()); return; }
   const gw = currentEvent.id;
 
-  // Entry + history + picks (for captain)
-  const [entry, history, picks] = await Promise.all([
+  // Entry + history + picks + live (for per-player points/bonus) 
+  const [entry, history, picks, live] = await Promise.all([
     fplEntry(teamId),
     fplEntryHistory(teamId),
-    fplEntryPicks(teamId, gw)
+    fplEntryPicks(teamId, gw),
+    fplEventLive(gw)
   ]);
-  if (!entry || !history) { await sendHTML(env, chatId, `${boldLabel("Error")} ${htmlEsc("Couldn't load your team right now.")}`, keyboardMain()); return; }
+  if (!entry || !history || !picks || !live) {
+    await sendHTML(env, chatId, `${boldLabel("Error")} ${htmlEsc("Couldn't load your team right now.")}`, keyboardMain());
+    return;
+  }
 
   const thisGw = (history.current || []).find(r => r.event === gw);
   const points = thisGw?.points ?? null;
@@ -159,32 +173,100 @@ async function handleMyTeam(env, msg) {
   const value  = thisGw?.value ?? history?.current?.slice(-1)?.[0]?.value ?? entry?.value ?? null; // tenths
   const bank   = thisGw?.bank ?? history?.current?.slice(-1)?.[0]?.bank ?? entry?.bank ?? null;
 
-  // Captain
-  let captainName = null;
-  if (picks?.picks?.length) {
-    const capEl = picks.picks.find(p => p.is_captain)?.element;
-    if (capEl) {
-      const el = (boot.elements || []).find(e => e.id === capEl);
-      if (el) captainName = `${el.web_name}`;
-    }
-  }
+  // Chips: active chip + available chips (based on history.chips played)
+  const activeChip = picks.active_chip || null;
+  const played = (history.chips || []).map(c => c.name);
+  const remaining = remainingChips(played);
 
-  const teamName = sanitizeAscii(`${entry.name || "Team"}`);
+  // Live points map & bonus extraction
+  const liveById = new Map();
+  (live.elements || []).forEach(e => {
+    const id = e.id;
+    const total = e.stats?.total_points ?? 0;
+    // Bonus can be inside explain (array of arrays) or stats.bonus depending on season
+    let bonus = 0;
+    if (Array.isArray(e.explain)) {
+      // e.explain => [{fixture, stats:[{identifier, points, value}]}, ...]
+      for (const ex of e.explain) {
+        for (const st of (ex.stats || [])) if (st.identifier === "bonus") bonus += (st.points || 0);
+      }
+    } else if (typeof e.stats?.bonus === "number") {
+      bonus = e.stats.bonus;
+    }
+    liveById.set(id, { total, bonus });
+  });
+
+  // Build squad: starters (positions 1–11) then bench (12–15)
+  const picksArr = (picks.picks || []).slice().sort((a,b) => a.position - b.position);
+  const starters = picksArr.filter(p => p.position <= 11);
+  const bench    = picksArr.filter(p => p.position >= 12);
+
+  const mulLabel = (m) => m === 0 ? "bench" : (m === 1 ? "" : `×${m}`);
   const fmtMoney = (v) => (typeof v === "number" ? (v/10).toFixed(1) : "-");
   const fmtNum   = (n) => (typeof n === "number" ? n.toLocaleString("en-GB") : "-");
 
-  const html = [
+  const capEl = starters.find(p => p.is_captain)?.element;
+  const vcEl  = picksArr.find(p => p.is_vice_captain)?.element;
+
+  const lineForPick = (p) => {
+    const el = elById.get(p.element);
+    if (!el) return null;
+    const liveStats = liveById.get(p.element) || { total: 0, bonus: 0 };
+    const name = `${el.web_name}`;
+    const club = teamShort(el.team);
+    const posMap = {1:"GKP",2:"DEF",3:"MID",4:"FWD"};
+    const pos = posMap[el.element_type] || "";
+    const isCap = p.element === capEl;
+    const isVC  = p.element === vcEl;
+    const mult  = p.multiplier || 0;
+
+    const rawPts = liveStats.total;
+    const effPts = rawPts * mult;
+    const bonusSuffix = liveStats.bonus > 0 ? ` ${htmlEsc(`(+${liveStats.bonus} bonus)`)}` : "";
+
+    const tags = isCap ? " (C)" : (isVC ? " (VC)" : "");
+    const multNote = mult === 0 ? " (bench)" : (mult === 1 ? "" : ` (×${mult}=${effPts})`);
+
+    return `${htmlEsc(name)} ${htmlEsc(`(${pos} - ${club})`)}\n${boldLabel("Points")} ${htmlEsc(String(rawPts))}${bonusSuffix}${htmlEsc(multNote)}`;
+  };
+
+  const startersLines = starters.map(lineForPick).filter(Boolean);
+  const benchLines    = bench.map(lineForPick).filter(Boolean);
+
+  const teamName = sanitizeAscii(`${entry.name || "Team"}`);
+
+  const header = [
     `<b>${htmlEsc(teamName)}</b>`,
     htmlEsc(`Gameweek ${gw} (current)`),
-    ``,
+  ].join("\n");
+
+  const overview = [
     points != null ? `${boldLabel("Points")} <b>${htmlEsc(String(points))}</b>` : "",
     rank   != null ? `${boldLabel("Overall Rank")} ${htmlEsc(fmtNum(rank))}` : "",
     value  != null ? `${boldLabel("Team Value")} ${htmlEsc(fmtMoney(value))}` : "",
     bank   != null ? `${boldLabel("Bank")} ${htmlEsc(fmtMoney(bank))}` : "",
-    captainName ? `${boldLabel("Captain")} ${htmlEsc(captainName)}` : "",
-    ``,
-    `${boldLabel("Shortcuts")} <code>/myteam</code>  |  <code>/linkteam &lt;YourTeamID&gt;</code>`
+    capEl  ? `${boldLabel("Captain")} ${htmlEsc(elById.get(capEl)?.web_name || "")}` : "",
+    vcEl   ? `${boldLabel("Vice-Captain")} ${htmlEsc(elById.get(vcEl)?.web_name || "")}` : ""
   ].filter(Boolean).join("\n");
+
+  const chipsBlock = [
+    activeChip ? `${boldLabel("Active Chip")} ${htmlEsc(prettyChip(activeChip))}` : `${boldLabel("Active Chip")} ${htmlEsc("None")}`,
+    `${boldLabel("Available Chips")} ${htmlEsc(remaining.join(", ") || "None")}`
+  ].join("\n");
+
+  const html = [
+    header,
+    ``,
+    overview,
+    ``,
+    `${boldLabel("Starting XI")}`,
+    startersLines.length ? startersLines.map(s => `• ${s}`).join("\n\n") : htmlEsc("No starters found."),
+    ``,
+    `${boldLabel("Bench")}`,
+    benchLines.length ? benchLines.map(s => `• ${s}`).join("\n\n") : htmlEsc("No bench found."),
+    ``,
+    chipsBlock
+  ].join("\n");
 
   await sendHTML(env, chatId, html, keyboardMain());
 }
@@ -268,12 +350,38 @@ async function fplEntryPicks(teamId, gw) {
   } catch { return null; }
 }
 
+async function fplEventLive(gw) {
+  try {
+    const r = await fetch(`https://fantasy.premierleague.com/api/event/${gw}/live/`, { cf: { cacheTtl: 30 } });
+    if (!r.ok) return null;
+    return await r.json().catch(() => null);
+  } catch { return null; }
+}
+
 /* ---------- utils ---------- */
 
 function parseCommand(text) {
   if (!text.startsWith("/")) return { name: "", args: [] };
   const [cmd, ...args] = text.split(/\s+/);
   return { name: cmd.slice(1).toLowerCase(), args };
+}
+
+// Chips remaining calculation
+function remainingChips(playedNames) {
+  const counts = { wildcard: 0, freehit: 0, bench_boost: 0, triple_captain: 0 };
+  for (const n of playedNames) if (n in counts) counts[n]++;
+  const rem = [];
+  // Wildcards: up to 2 per season
+  const wcLeft = Math.max(0, 2 - counts.wildcard);
+  if (wcLeft > 0) rem.push(wcLeft === 2 ? "Wildcard ×2" : "Wildcard");
+  if (counts.freehit === 0) rem.push("Free Hit");
+  if (counts.bench_boost === 0) rem.push("Bench Boost");
+  if (counts.triple_captain === 0) rem.push("Triple Captain");
+  return rem;
+}
+function prettyChip(name) {
+  const map = { freehit: "Free Hit", bench_boost: "Bench Boost", triple_captain: "Triple Captain", wildcard: "Wildcard" };
+  return map[name] || name;
 }
 
 // Normalize smart punctuation -> ASCII
@@ -294,6 +402,9 @@ function stripHtml(s) { return s.replace(/<[^>]+>/g, ""); }
 
 // Label helper: **Bold first word**
 function boldLabel(label) { return `<b>${htmlEsc(label)}:</b>`; }
+
+/* ---------- HTTP helper ---------- */
+const text = (s, status = 200) => new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 
 /* ---------- KV keys ---------- */
 const kLastSeen     = id => `chat:${id}:last_seen`;
