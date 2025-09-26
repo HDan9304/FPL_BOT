@@ -39,7 +39,7 @@ async function handleTransfer(env,m){
     const sp=sellPrice(p,e); // tenths
     const line=`${esc(e.web_name)} ${esc(`(${abbr(e.team)}, ${pos(e.element_type)})`)} ${esc(`£${(sp/10).toFixed(1)} sell`)}`;
     if(e.element_type===1)group.GK.push(line); else if(e.element_type===2)group.DEF.push(line); else if(e.element_type===3)group.MID.push(line); else group.FWD.push(line);
-  )}
+  }
 
   const fmtUTC=d=>{const z=n=>String(n).padStart(2,"0");return `${d.getUTCFullYear()}-${z(d.getUTCMonth()+1)}-${z(d.getUTCDate())} ${z(d.getUTCHours())}:${z(d.getUTCMinutes())} UTC`};
   const countdown=ms=>{if(ms<=0)return "deadline passed";const d=Math.floor(ms/864e5),h=Math.floor(ms%864e5/36e5),m=Math.floor(ms%36e5/6e4);return `${d}d ${h}h ${m}m`};
