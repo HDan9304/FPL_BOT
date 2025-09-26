@@ -10,7 +10,7 @@ export default {
     // Health
     if (req.method === "GET" && (path === "" || path === "/")) return text("OK");
 
-    // One-click webhook init
+    // Webhook init
     if (req.method === "GET" && path === "/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method: "POST",
@@ -45,7 +45,7 @@ export default {
         case "start":    await handleStart(env, msg); break;
         case "linkteam": await handleLinkTeam(env, msg, cmd.args); break;
         case "myteam":   await handleMyTeam(env, msg); break;
-        default: /* silent */ break;
+        default: break;
       }
       return text("ok");
     }
@@ -54,7 +54,7 @@ export default {
   }
 };
 
-/* ---------- HTTP helper (single definition) ---------- */
+/* ---------- HTTP helper ---------- */
 const text = (s, status = 200) =>
   new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 
@@ -140,18 +140,16 @@ async function handleMyTeam(env, msg) {
     return;
   }
 
-  // Bootstrap (current event + elements & teams)
+  // Load static + live data
   const boot = await fplBootstrap();
   if (!boot) { await sendHTML(env, chatId, `${boldLabel("Busy")} ${htmlEsc("FPL is busy. Try again shortly.")}`, keyboardMain()); return; }
 
-  const events = boot.events || [];
-  const elements = boot.elements || [];
-  const teams = boot.teams || [];
-  const elById = new Map(elements.map(e => [e.id, e]));
-  const teamShort = (tid) => {
-    const t = teams.find(x => x.id === tid);
-    return t ? t.short_name : "";
-  };
+  const events    = boot.events || [];
+  const elements  = boot.elements || [];
+  const teams     = boot.teams || [];
+  const elById    = new Map(elements.map(e => [e.id, e]));
+  const clubAbbr  = (tid) => (teams.find(x => x.id === tid)?.short_name || "");
+  const posName   = (t) => ({1:"GK",2:"DEF",3:"MID",4:"FWD"}[t] || "");
 
   const currentEvent = events.find(e => e.is_current)
                     || events.filter(e => e.finished).sort((a,b)=>b.id-a.id)[0]
@@ -159,7 +157,6 @@ async function handleMyTeam(env, msg) {
   if (!currentEvent) { await sendHTML(env, chatId, `${boldLabel("Oops")} ${htmlEsc("Couldn't determine the current gameweek.")}`, keyboardMain()); return; }
   const gw = currentEvent.id;
 
-  // Entry + history + picks + live (for per-player points/bonus) 
   const [entry, history, picks, live] = await Promise.all([
     fplEntry(teamId),
     fplEntryHistory(teamId),
@@ -171,110 +168,129 @@ async function handleMyTeam(env, msg) {
     return;
   }
 
+  // Overview numbers
   const thisGw = (history.current || []).find(r => r.event === gw);
   const points = thisGw?.points ?? null;
   const rank   = thisGw?.overall_rank ?? thisGw?.rank ?? null;
   const value  = thisGw?.value ?? history?.current?.slice(-1)?.[0]?.value ?? entry?.value ?? null; // tenths
   const bank   = thisGw?.bank ?? history?.current?.slice(-1)?.[0]?.bank ?? entry?.bank ?? null;
 
-  // Chips: active chip + available chips (based on history.chips played)
-  const activeChip = picks.active_chip || null;
-  const played = (history.chips || []).map(c => c.name);
-  const remaining = remainingChips(played);
-
-  // Live points map & bonus extraction
-  const liveById = new Map();
-  (live.elements || []).forEach(e => {
-    const id = e.id;
-    const total = e.stats?.total_points ?? 0;
-    let bonus = 0;
-    if (Array.isArray(e.explain)) {
-      for (const ex of e.explain) {
-        for (const st of (ex.stats || [])) if (st.identifier === "bonus") bonus += (st.points || 0);
-      }
-    } else if (typeof e.stats?.bonus === "number") {
-      bonus = e.stats.bonus;
-    }
-    liveById.set(id, { total, bonus });
-  });
-
-  // Build squad: starters (positions 1–11) then bench (12–15)
+  // Picks & live map
   const picksArr = (picks.picks || []).slice().sort((a,b) => a.position - b.position);
   const starters = picksArr.filter(p => p.position <= 11);
   const bench    = picksArr.filter(p => p.position >= 12);
 
-  const fmtMoney = (v) => (typeof v === "number" ? (v/10).toFixed(1) : "-");
-  const fmtNum   = (n) => (typeof n === "number" ? n.toLocaleString("en-GB") : "-");
+  const liveById = new Map();
+  (live.elements || []).forEach(e => {
+    let bonus = 0;
+    if (Array.isArray(e.explain)) {
+      for (const ex of e.explain) for (const st of (ex.stats || [])) if (st.identifier === "bonus") bonus += (st.points || 0);
+    } else if (typeof e.stats?.bonus === "number") bonus = e.stats.bonus;
+    liveById.set(e.id, { total: e.stats?.total_points ?? 0, bonus });
+  });
 
+  // Captain / VC
   const capEl = starters.find(p => p.is_captain)?.element;
   const vcEl  = picksArr.find(p => p.is_vice_captain)?.element;
+
+  // Build grouped lines for starters by position
+  const group = { GK: [], DEF: [], MID: [], FWD: [] };
 
   const lineForPick = (p) => {
     const el = elById.get(p.element);
     if (!el) return null;
     const liveStats = liveById.get(p.element) || { total: 0, bonus: 0 };
-    const name = `${el.web_name}`;
-    const club = teamShort(el.team);
-    const posMap = {1:"GKP",2:"DEF",3:"MID",4:"FWD"};
-    const pos = posMap[el.element_type] || "";
+    const name  = `${el.web_name}`;
+    const club  = clubAbbr(el.team);
+    const pos   = posName(el.element_type);
+    const mult  = p.multiplier || 0;
     const isCap = p.element === capEl;
     const isVC  = p.element === vcEl;
-    const mult  = p.multiplier || 0;
 
     const rawPts = liveStats.total;
-    const effPts = rawPts * mult;
-    const bonusSuffix = liveStats.bonus > 0 ? ` ${htmlEsc("(+" + liveStats.bonus + " bonus)")}` : "";
-    const multNote = mult === 0 ? " (bench)" : (mult === 1 ? "" : " (x" + mult + "=" + effPts + ")");
+    const bonusSuffix = liveStats.bonus > 0 ? ` (+${liveStats.bonus} bonus)` : "";
+    const multNote   = mult === 0 ? " (bench)" : (mult === 1 ? "" : ` (x${mult}=${rawPts*mult})`);
+    const tag        = isCap ? " (C)" : (isVC ? " (VC)" : "");
 
-    const tag = isCap ? " (C)" : (isVC ? " (VC)" : "");
-
-    return `${htmlEsc(name + tag)} ${htmlEsc("(" + pos + " - " + club + ")")}\n${boldLabel("Points")} ${htmlEsc(String(rawPts))}${bonusSuffix}${htmlEsc(multNote)}`;
+    // Format: "Name (TEAM, POS) points ..."
+    return `${htmlEsc(`${name}${tag}`)} ${htmlEsc(`(${club}, ${pos})`)} ${htmlEsc(String(rawPts))}${htmlEsc(bonusSuffix)}${htmlEsc(multNote)}`;
   };
 
-  const startersLines = starters.map(lineForPick).filter(Boolean);
-  const benchLines    = bench.map(lineForPick).filter(Boolean);
+  for (const p of starters) {
+    const el = elById.get(p.element); if (!el) continue;
+    const pos = posName(el.element_type);
+    const line = lineForPick(p);
+    if (!line) continue;
+    if (pos === "GK") group.GK.push(line);
+    else if (pos === "DEF") group.DEF.push(line);
+    else if (pos === "MID") group.MID.push(line);
+    else if (pos === "FWD") group.FWD.push(line);
+  }
 
+  // Bench lines (same style)
+  const benchLines = bench.map(lineForPick).filter(Boolean);
+
+  // Chips
+  const activeChip = picks.active_chip || null;
+  const played = (history.chips || []).map(c => c.name);
+  const remaining = remainingChips(played);
+
+  // Format top (important first)
   const teamName = sanitizeAscii(`${entry.name || "Team"}`);
+  const fmtMoney = (v) => (typeof v === "number" ? (v/10).toFixed(1) : "-");
+  const fmtNum   = (n) => (typeof n === "number" ? n.toLocaleString("en-GB") : "-");
 
   const header = [
     `<b>${htmlEsc(teamName)}</b>`,
-    htmlEsc("Gameweek " + gw + " (current)")
+    htmlEsc(`Gameweek ${gw} (current)`)
   ].join("\n");
 
-  const overview = [
+  const overviewTop = [
     points != null ? `${boldLabel("Points")} <b>${htmlEsc(String(points))}</b>` : "",
     rank   != null ? `${boldLabel("Overall Rank")} ${htmlEsc(fmtNum(rank))}` : "",
     value  != null ? `${boldLabel("Team Value")} ${htmlEsc(fmtMoney(value))}` : "",
     bank   != null ? `${boldLabel("Bank")} ${htmlEsc(fmtMoney(bank))}` : "",
     capEl  ? `${boldLabel("Captain")} ${htmlEsc(elById.get(capEl)?.web_name || "")}` : "",
-    vcEl   ? `${boldLabel("Vice-Captain")} ${htmlEsc(elById.get(vcEl)?.web_name || "")}` : ""
+    vcEl   ? `${boldLabel("Vice-Captain")} ${htmlEsc(elById.get(vcEl)?.web_name || "")}` : "",
+    activeChip ? `${boldLabel("Active Chip")} ${htmlEsc(prettyChip(activeChip))}` : `${boldLabel("Active Chip")} ${htmlEsc("None")}`
   ].filter(Boolean).join("\n");
 
-  const chipsBlock = [
-    activeChip ? `${boldLabel("Active Chip")} ${htmlEsc(prettyChip(activeChip))}` : `${boldLabel("Active Chip")} ${htmlEsc("None")}`,
-    `${boldLabel("Available Chips")} ${htmlEsc(remaining.join(", ") || "None")}`
+  // Position sections exactly like your example
+  const section = (label, lines) => {
+    if (!lines.length) return "";
+    return `${boldLabel(label)} ${lines[0]}\n${lines.slice(1).map(s => s).join("\n")}`;
+  };
+
+  const startersBlock = [
+    section("GK",  group.GK),
+    ``,
+    section("DEF", group.DEF),
+    ``,
+    section("MID", group.MID),
+    ``,
+    section("FWD", group.FWD)
   ].join("\n");
+
+  const chipsBottom = `${boldLabel("Available Chips")} ${htmlEsc(remaining.join(", ") || "None")}`;
 
   const html = [
     header,
     ``,
-    overview,
+    overviewTop,          // important info first
     ``,
-    `${boldLabel("Starting XI")}`,
-    startersLines.length ? startersLines.map(s => `- ${s}`).join("\n\n") : htmlEsc("No starters found."),
+    startersBlock,        // grouped XI by positions
     ``,
-    `${boldLabel("Bench")}`,
-    benchLines.length ? benchLines.map(s => `- ${s}`).join("\n\n") : htmlEsc("No bench found."),
+    benchLines.length ? `${boldLabel("Bench")} ${benchLines[0]}\n${benchLines.slice(1).join("\n")}` : "",
     ``,
-    chipsBlock
-  ].join("\n");
+    chipsBottom           // less important at the bottom
+  ].filter(Boolean).join("\n");
 
   await sendHTML(env, chatId, html, keyboardMain());
 }
 
 /* ---------- Telegram (HTML) ---------- */
 
-// Reply keyboard (clean & minimal)
+// Reply keyboard
 function keyboardMain() {
   return {
     keyboard: [
@@ -369,7 +385,6 @@ function remainingChips(playedNames) {
   const counts = { wildcard: 0, freehit: 0, bench_boost: 0, triple_captain: 0 };
   for (const n of playedNames) if (n in counts) counts[n]++;
   const rem = [];
-  // Wildcards: up to 2 per season
   const wcLeft = Math.max(0, 2 - counts.wildcard);
   if (wcLeft > 0) rem.push(wcLeft === 2 ? "Wildcard x2" : "Wildcard");
   if (counts.freehit === 0) rem.push("Free Hit");
