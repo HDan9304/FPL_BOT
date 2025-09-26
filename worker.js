@@ -193,7 +193,7 @@ async function handleMyTeam(env, msg) {
   const capEl = starters.find(p => p.is_captain)?.element;
   const vcEl  = picksArr.find(p => p.is_vice_captain)?.element;
 
-  // Build grouped lines for starters by position
+  // Group XI by position and render inline with label
   const group = { GK: [], DEF: [], MID: [], FWD: [] };
 
   const lineForPick = (p) => {
@@ -227,15 +227,14 @@ async function handleMyTeam(env, msg) {
     else if (pos === "FWD") group.FWD.push(line);
   }
 
-  // Bench lines (same style)
   const benchLines = bench.map(lineForPick).filter(Boolean);
 
   // Chips
   const activeChip = picks.active_chip || null;
   const played = (history.chips || []).map(c => c.name);
-  const remaining = remainingChips(played);
+  const remaining = remainingChips(played); // "Wildcard" appears once if any left
 
-  // --- UI: compact top summary with | separators ---
+  // --- UI ---
   const teamName = sanitizeAscii(`${entry.name || "Team"}`);
   const fmtMoney = (v) => (typeof v === "number" ? (v/10).toFixed(1) : "-");
   const fmtNum   = (n) => (typeof n === "number" ? n.toLocaleString("en-GB") : "-");
@@ -255,36 +254,26 @@ async function handleMyTeam(env, msg) {
     boldFirst("Active Chip", activeChip ? prettyChip(activeChip) : "None")
   ]);
 
-  // Position sections (spaced)
-  const sectionBlock = (label, lines) =>
-    lines.length ? [`${boldLabel(label)}`, lines.join("\n")].join("\n") : "";
-
+  // Position sections with inline label, tidy indent, and a trailing blank line
   const startersBlock = [
-    sectionBlock("GK",  group.GK),
-    ``,
-    sectionBlock("DEF", group.DEF),
-    ``,
-    sectionBlock("MID", group.MID),
-    ``,
-    sectionBlock("FWD", group.FWD)
+    prefixedSection("GK",  group.GK),
+    prefixedSection("DEF", group.DEF),
+    prefixedSection("MID", group.MID),
+    prefixedSection("FWD", group.FWD)
   ].filter(Boolean).join("\n");
 
-  const benchBlock = benchLines.length
-    ? [`${boldLabel("Bench")}`, benchLines.join("\n")].join("\n")
-    : "";
+  const benchBlock = benchLines.length ? prefixedSection("Bench", benchLines) : "";
 
-  const chipsBottom = `${boldLabel("Available Chips")} ${htmlEsc(remaining.join(", ") || "None")}`;
+  const chipsBottom = `${boldLabel("Available Chips")} ${htmlEsc((remaining.join(", ") || "None").trim())}`;
 
   const html = [
     header,
-    ``,
+    "",
     summaryLine1,
     summaryLine2,
-    ``,
+    "",
     startersBlock,
-    ``,
-    benchBlock,
-    ``,
+    benchBlock,     // prefixedSection already adds a blank line after it
     chipsBottom
   ].filter(Boolean).join("\n");
 
@@ -383,13 +372,13 @@ function parseCommand(text) {
   return { name: cmd.slice(1).toLowerCase(), args };
 }
 
-// Chips remaining calculation
+// Chips remaining calculation (Wildcard shown once if any remain)
 function remainingChips(playedNames) {
   const counts = { wildcard: 0, freehit: 0, bench_boost: 0, triple_captain: 0 };
   for (const n of playedNames) if (n in counts) counts[n]++;
   const rem = [];
   const wcLeft = Math.max(0, 2 - counts.wildcard);
-  if (wcLeft > 0) rem.push(wcLeft === 2 ? "Wildcard x2" : "Wildcard");
+  if (wcLeft > 0) rem.push("Wildcard");  // show once even if 2 remain
   if (counts.freehit === 0) rem.push("Free Hit");
   if (counts.bench_boost === 0) rem.push("Bench Boost");
   if (counts.triple_captain === 0) rem.push("Triple Captain");
@@ -398,6 +387,14 @@ function remainingChips(playedNames) {
 function prettyChip(name) {
   const map = { freehit: "Free Hit", bench_boost: "Bench Boost", triple_captain: "Triple Captain", wildcard: "Wildcard" };
   return map[name] || name;
+}
+
+// Section renderer: inline label + first item, indented rest, and a trailing blank line
+function prefixedSection(label, lines) {
+  if (!lines.length) return "";
+  const head = `${boldLabel(label)} ${lines[0]}`;
+  const rest = lines.slice(1).map(s => `  ${s}`);
+  return [head, ...rest, ""].join("\n");
 }
 
 // Normalize smart punctuation -> ASCII
@@ -418,16 +415,10 @@ function stripHtml(s) { return s.replace(/<[^>]+>/g, ""); }
 
 // Label helpers
 function boldLabel(label) { return `<b>${htmlEsc(label)}:</b>`; }
-
 // "Label: value" with bolded first word, safe-escaped
-function boldFirst(label, value) {
-  return `<b>${htmlEsc(label)}:</b> ${htmlEsc(String(value))}`;
-}
-
-// Join chunks with " | "
-function joinWithPipes(parts) {
-  return parts.filter(Boolean).join(` ${htmlEsc("|")} `);
-}
+function boldFirst(label, value) { return `<b>${htmlEsc(label)}:</b> ${htmlEsc(String(value))}`; }
+// Join parts with " | "
+function joinWithPipes(parts) { return parts.filter(Boolean).join(` ${htmlEsc("|")} `); }
 
 /* ---------- KV keys ---------- */
 const kLastSeen     = id => `chat:${id}:last_seen`;
