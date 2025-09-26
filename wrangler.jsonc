@@ -1,6 +1,6 @@
 {
   "name": "fpl-telegram-bot",
-  "main": "worker.js",
+  "main": "src/index.js",
   "compatibility_date": "2025-09-26",
 
   // Bindings
