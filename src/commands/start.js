@@ -11,6 +11,7 @@ export default async function start(env, chatId, from) {
     `${B("What I can do now")}`,
     "• /link  — save your FPL team",
     "• /unlink — forget the saved team",
+    "• /transfer — view transfer header (bank, FT, hits)"
   ].join("\n");
 
   await send(env, chatId, html, "HTML");
