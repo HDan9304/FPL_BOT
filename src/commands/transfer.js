@@ -1,9 +1,9 @@
-// src/commands/transfer.js — AUTO MODE (Pro preset) + DGW/Blank badges + chase/pos + list vs sell
-// Usage: /transfer [chase] [pos=DEF]    (args optional; router should pass arg string if available)
+// src/commands/transfer.js — AUTO MODE via presets + DGW/Blank badges + chase/pos + list vs sell
+// Usage: /transfer [chase] [pos=DEF]
 
 import { send } from "../utils/telegram.js";
 import { esc } from "../utils/fmt.js";
-import { autoPreset, PRESETS } from "../presets.js";
+import { chooseAutoConfig } from "../presets.js";
 
 const kUser   = (id) => `user:${id}:profile`;
 const B       = (s) => `<b>${esc(s)}</b>`;
@@ -39,15 +39,13 @@ export default async function transfer(env, chatId, arg = "") {
   const nextGW = getNextGwId(bootstrap);
   const curGW  = getCurrentGw(bootstrap);
 
-  // Args: "chase" & "pos=DEF|MID|FWD|GK"
+  // Parse optional args: "chase" & "pos=DEF|MID|FWD|GK"
   const opts = parseArgs(arg);
   const picks  = await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`);
   if (!picks) { await send(env, chatId, "Couldn't fetch your picks (is your team private?)."); return; }
 
-  // ---- Auto preset (Pro baseline) + optional chase tweak ----
-  let cfg = autoPreset({ bootstrap, fixtures, picks }, PRESETS.PRO);
-  if (opts.chase) { cfg = { ...cfg, min: Math.min(cfg.min, 75), hit: 4, h: Math.max(cfg.h, 3) }; }
-  const focusType = opts.posType;
+  // ---- AUTO CONFIG via presets (keeps your Pro Auto behavior; now centralized) ----
+  const cfg = chooseAutoConfig({ bootstrap, fixtures, picks, entry, mode: "pro", chase: opts.chase });
 
   // bank & roster
   const bank =
@@ -84,7 +82,7 @@ export default async function transfer(env, chatId, arg = "") {
 
   // OUT candidates (weakest starters), optionally focus a position
   const outCands = startersEls
-    .filter(el => !focusType || el.element_type === focusType)
+    .filter(el => !opts.posType || el.element_type === opts.posType)
     .map(el => ({
       id: el.id,
       name: playerShort(el),
@@ -103,7 +101,7 @@ export default async function transfer(env, chatId, arg = "") {
   const poolByPos = {1:[],2:[],3:[],4:[]};
   for (const el of (bootstrap?.elements || [])) {
     if (chance(el) < cfg.min) continue;
-    if (focusType && el.element_type !== focusType) continue;
+    if (opts.posType && el.element_type !== opts.posType) continue;
     const r = rowForHorizon(el, fixtures, teams, nextGW, cfg.h, cfg.damp, cfg.min);
     poolByPos[el.element_type].push({
       id: el.id,
@@ -162,7 +160,7 @@ export default async function transfer(env, chatId, arg = "") {
   const blankTeams = Object.keys(teams).filter(tid => (counts[tid] || 0) === 0);
   const badge = badgeLine(dgwTeams.length, blankTeams.length);
 
-  // Plans A–D
+  // Plans A–D (with inline WHY)
   const planA = mkPlanA(rejections);
   const planB = mkPlanB(singles, cfg.ft);
   const planC = bestCombo(singles.slice(0, 120), 2, teamCounts, MAX_PER_TEAM, bank, cfg.ft);
@@ -183,8 +181,8 @@ export default async function transfer(env, chatId, arg = "") {
   const head = [
     `${B("Team")}: ${esc(entry?.name || "—")} | ${B("GW")}: ${nextGW} — Transfer Plan (Next)`,
     `${B("Bank")}: ${esc(gbp(bank))} | ${B("FT (assumed)")}: ${cfg.ft} | ${B("Hits")}: -4 per extra move`,
-    `${B("Model")}: ${opts.chase ? "Chasing" : "Pro Auto"} — h=${cfg.h}, min=${cfg.min}%, damp=${cfg.damp} | ${B("Hit OK if Net ≥")} ${cfg.hit}` +
-    (focusType ? ` | ${B("Focus")}: ${posName(focusType)}` : "")
+    `${B("Preset")}: ${cfg.presetName}${opts.chase ? " (Chasing)" : ""} — h=${cfg.h}, min=${cfg.min}%, damp=${cfg.damp} | ${B("Hit OK if Net ≥")} ${cfg.hit}` +
+    (opts.posType ? ` | ${B("Focus")}: ${posName(opts.posType)}` : "")
   ].join("\n");
 
   const blocks = [];
@@ -215,7 +213,7 @@ function parseArgs(arg){
   return out;
 }
 
-/* ---------- planning helpers / unchanged from previous ---------- */
+/* ---------- planning helpers ---------- */
 function mkPlanA(rejections){
   const why = [];
   if (Array.isArray(rejections) && rejections.length) {
@@ -234,6 +232,7 @@ function mkPlanA(rejections){
   }
   return { moves: [], delta: 0, hit: 0, net: 0, why };
 }
+
 function mkPlanB(singles, ft){
   if (!singles.length) return mkPlanA();
   const s = singles[0];
@@ -246,6 +245,7 @@ function mkPlanB(singles, ft){
   if (hit>0) why.push(`-4 applied (1 FT used already)`);
   return { moves:[s], delta: raw, hit, net: raw - hit, why };
 }
+
 function bestCombo(singles, K, teamCounts, MAX_PER_TEAM, bank, ft){
   if (!singles.length || K < 2) return mkPlanA();
 
@@ -295,6 +295,7 @@ function bestCombo(singles, K, teamCounts, MAX_PER_TEAM, bank, ft){
   if (best.hit>0) best.why = [...(best.why||[]), `Includes -${best.hit} hit; net ${best.net>=0?"+":""}${best.net.toFixed(2)}`];
   return best;
 }
+
 function renderPlan(title, plan, teams, nextGW, counts){
   const lines = [];
   lines.push(`<b>${esc(title)}</b>`);
@@ -306,6 +307,7 @@ function renderPlan(title, plan, teams, nextGW, counts){
       const outTag = fixtureBadgeForTeam(m.outTeamId, nextGW, counts);
       lines.push(`• ${i+1}) OUT: ${esc(m.outName)} (${esc(m.outTeam)}) ${outTag} → IN: ${esc(m.inName)} (${esc(m.inTeam)}) ${inTag}`);
       lines.push(`   ΔScore: +${m.delta.toFixed(2)} | Price: ${m.priceDiff>=0?"+":""}${gbp(m.priceDiff)} | Bank left: ${gbp(m.bankLeft)}`);
+      // list vs sell price
       lines.push(`   Prices: OUT sell ${gbp(m.outSell)} | IN list ${gbp(m.inPrice)}`);
     });
     lines.push(`Net (after hits): ${(plan.net>=0?"+":"")}${plan.net.toFixed(2)}  |  Raw Δ: +${plan.delta.toFixed(2)}  |  Hits: -${plan.hit}`);
@@ -388,7 +390,7 @@ function fdrMult(fdr){
   return 1.30 - 0.10 * x; // easy → ~1.10, hard → ~0.80
 }
 
-/* ---------- misc utils ---------- */
+/* ---------- team state signals ---------- */
 function chance(el){
   const v = parseInt(el?.chance_of_playing_next_round ?? "100", 10);
   return Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : 100;
