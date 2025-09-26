@@ -1,6 +1,5 @@
-// src/commands/transfer.js — AUTO MODE (Pro preset) with EXPLANATIONS
-// Usage: /transfer
-// Requires: utils/telegram.send, utils/fmt.esc, KV key user:<chatId>:profile
+// src/commands/transfer.js — AUTO MODE (Pro preset) + DGW/Blank badges + chase/pos + list vs sell
+// Usage: /transfer [chase] [pos=DEF]    (args optional; router should pass arg string if available)
 
 import { send } from "../utils/telegram.js";
 import { esc } from "../utils/fmt.js";
@@ -9,10 +8,8 @@ const kUser   = (id) => `user:${id}:profile`;
 const B       = (s) => `<b>${esc(s)}</b>`;
 const gbp     = (n) => (n == null ? "—" : `£${Number(n).toFixed(1)}`);
 const posName = (t) => ({1:"GK",2:"DEF",3:"MID",4:"FWD"})[t] || "?";
+const posCodeToType = (s) => ({GK:1,GKP:1,DEF:2,DEFENDER:2,MID:3,MIDF:3,MF:3,FWD:4,FW:4,FORWARD:4}[String(s||"").toUpperCase()]||null);
 
-/* =======================
-   Pro preset (recommended)
-   ======================= */
 // Noise guards
 const MIN_DELTA_SINGLE = 0.5;  // ignore micro “upgrades”
 const MIN_DELTA_COMBO  = 1.5;  // total raw gain required before hits
@@ -20,7 +17,7 @@ const MIN_DELTA_COMBO  = 1.5;  // total raw gain required before hits
 const MAX_POOL_PER_POS = 500;
 const MAX_SINGLE_SCAN  = 500;
 
-export default async function transfer(env, chatId) {
+export default async function transfer(env, chatId, arg = "") {
   const pRaw = env.FPL_BOT_KV ? await env.FPL_BOT_KV.get(kUser(chatId)) : null;
   const teamId = pRaw ? (JSON.parse(pRaw).teamId) : null;
   if (!teamId) {
@@ -40,11 +37,16 @@ export default async function transfer(env, chatId) {
 
   const nextGW = getNextGwId(bootstrap);
   const curGW  = getCurrentGw(bootstrap);
+
+  // Parse optional args: "chase" & "pos=DEF|MID|FWD|GK"
+  const opts = parseArgs(arg);
   const picks  = await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`);
   if (!picks) { await send(env, chatId, "Couldn't fetch your picks (is your team private?)."); return; }
 
-  // Pro auto-tune
-  const cfg = autoTuneSettings({ bootstrap, fixtures, picks });
+  // Pro auto-tune (+ chase override)
+  let cfg = autoTuneSettings({ bootstrap, fixtures, picks });
+  if (opts.chase) { cfg = { ...cfg, min: Math.min(cfg.min, 75), hit: 4 }; } // looser, more aggressive
+  const focusType = opts.posType; // if provided, constrain swaps to that position
 
   // bank & roster
   const bank =
@@ -79,8 +81,9 @@ export default async function transfer(env, chatId) {
     byRow[el.id] = rowForHorizon(el, fixtures, teams, nextGW, cfg.h, cfg.damp, cfg.min);
   }
 
-  // OUT candidates (weakest starters)
+  // OUT candidates (weakest starters), optionally focus a position
   const outCands = startersEls
+    .filter(el => !focusType || el.element_type === focusType)
     .map(el => ({
       id: el.id,
       name: playerShort(el),
@@ -88,16 +91,18 @@ export default async function transfer(env, chatId) {
       teamId: el.team,
       team: teamShort(teams, el.team),
       sell: sell[el.id] || ((el.now_cost || 0)/10),
+      listPrice: (el.now_cost || 0)/10,
       score: byRow[el.id]?.score ?? 0
     }))
     .sort((a,b)=>a.score-b.score)
     .slice(0, 11);
 
-  // Market pool by position (minutes filter)
+  // Market pool by position (minutes filter), optionally focus
   const MAX_PER_TEAM = 3;
   const poolByPos = {1:[],2:[],3:[],4:[]};
   for (const el of (bootstrap?.elements || [])) {
     if (chance(el) < cfg.min) continue;
+    if (focusType && el.element_type !== focusType) continue;
     const r = rowForHorizon(el, fixtures, teams, nextGW, cfg.h, cfg.damp, cfg.min);
     poolByPos[el.element_type].push({
       id: el.id,
@@ -105,7 +110,7 @@ export default async function transfer(env, chatId) {
       team: teamShort(teams, el.team),
       teamId: el.team,
       pos: posName(el.element_type),
-      price: (el.now_cost || 0) / 10,
+      price: (el.now_cost || 0) / 10,     // LIST price (what you pay)
       score: r.score
     });
   }
@@ -113,17 +118,17 @@ export default async function transfer(env, chatId) {
 
   // Singles with EXPLANATIONS
   const singles = [];
-  const rejections = []; // record why we skipped candidates
+  const rejections = [];
   outer:
   for (const out of outCands) {
-    const list = poolByPos[out.posT];
+    const list = poolByPos[out.posT] || [];
     for (let i=0; i<list.length && singles.length<MAX_SINGLE_SCAN; i++) {
       const IN = list[i];
 
       if (IN.id === out.id) { rejections.push(reason("same-player", out, IN)); continue; }
       if (ownedIds.has(IN.id)) { rejections.push(reason("already-owned", out, IN)); continue; }
 
-      const priceDiff = IN.price - out.sell;
+      const priceDiff = IN.price - out.sell;     // use SELL for OUT, LIST for IN
       if (priceDiff > bank + 1e-9) { rejections.push(reason("bank", out, IN, { need: priceDiff - bank })); continue; }
 
       const newCountIn = (teamCounts[IN.teamId] || 0) + (IN.teamId === out.teamId ? 0 : 1);
@@ -138,7 +143,9 @@ export default async function transfer(env, chatId) {
         outTeamId: out.teamId, inTeamId: IN.teamId,
         outTeam: out.team, inTeam: IN.team,
         pos: out.posT,
-        outSell: out.sell, inPrice: IN.price,
+        outSell: out.sell,           // SELL price for OUT
+        outList: out.listPrice,      // current list for OUT (info)
+        inPrice: IN.price,           // LIST price for IN
         priceDiff, bankLeft: bank - priceDiff,
         delta,
         why: ["passed: legal, bank ok, Δ≥0.5, minutes ok"]
@@ -148,6 +155,12 @@ export default async function transfer(env, chatId) {
   }
   singles.sort((a,b)=>b.delta-a.delta);
 
+  // DGW/Blank detector (for the next GW)
+  const counts = gwFixtureCounts(fixtures, nextGW);
+  const dgwTeams = Object.keys(counts).filter(tid => counts[tid] > 1);
+  const blankTeams = Object.keys(teams).filter(tid => (counts[tid] || 0) === 0);
+  const badge = badgeLine(dgwTeams.length, blankTeams.length);
+
   // Plans A–D (with inline WHY)
   const planA = mkPlanA(rejections);
   const planB = mkPlanB(singles, cfg.ft);
@@ -155,10 +168,10 @@ export default async function transfer(env, chatId) {
   const planD = bestCombo(singles.slice(0, 160), 3, teamCounts, MAX_PER_TEAM, bank, cfg.ft);
 
   const plans = [
-    { key:"A", title:"Plan A — 0 transfers", ...planA },
-    { key:"B", title:"Plan B — 1 transfer",  ...planB },
-    { key:"C", title:"Plan C — 2 transfers", ...planC },
-    { key:"D", title:"Plan D — 3 transfers", ...planD }
+    { key:"A", title:`Plan A — 0 transfers ${badge}`, ...planA },
+    { key:"B", title:`Plan B — 1 transfer ${badge}`,  ...planB },
+    { key:"C", title:`Plan C — 2 transfers ${badge}`, ...planC },
+    { key:"D", title:`Plan D — 3 transfers ${badge}`, ...planD }
   ];
 
   // choose recommendation
@@ -169,17 +182,36 @@ export default async function transfer(env, chatId) {
   const head = [
     `${B("Team")}: ${esc(entry?.name || "—")} | ${B("GW")}: ${nextGW} — Transfer Plan (Next)`,
     `${B("Bank")}: ${esc(gbp(bank))} | ${B("FT (assumed)")}: ${cfg.ft} | ${B("Hits")}: -4 per extra move`,
-    `${B("Model")}: Pro Auto — h=${cfg.h}, min=${cfg.min}%, damp=${cfg.damp} | ${B("Hit OK if Net ≥")} ${cfg.hit}`
+    `${B("Model")}: ${opts.chase ? "Chasing" : "Pro Auto"} — h=${cfg.h}, min=${cfg.min}%, damp=${cfg.damp} | ${B("Hit OK if Net ≥")} ${cfg.hit}` +
+    (focusType ? ` | ${B("Focus")}: ${posName(focusType)}` : "")
   ].join("\n");
 
   const blocks = [];
   for (const p of plans) {
     const title = p.key === recommend ? `✅ ${p.title} (recommended)` : p.title;
-    blocks.push(renderPlan(title, p));
+    blocks.push(renderPlan(title, p, teams, nextGW, counts));
   }
 
   const html = [head, "", ...blocks].join("\n\n");
   await send(env, chatId, html, "HTML");
+}
+
+/* ---------- parse args ---------- */
+function parseArgs(arg){
+  const a = String(arg||"").trim();
+  const out = { chase:false, posType:null };
+  if (!a) return out;
+  const toks = a.split(/\s+/).filter(Boolean);
+  for (const t of toks){
+    if (/^chase$/i.test(t)) { out.chase = true; continue; }
+    const m = t.match(/^pos=(.+)$/i);
+    if (m) {
+      const pt = posCodeToType(m[1]);
+      if (pt) out.posType = pt;
+      continue;
+    }
+  }
+  return out;
 }
 
 /* ---------- auto tuner (Pro) ---------- */
@@ -188,17 +220,10 @@ function autoTuneSettings({ bootstrap, fixtures, picks }, base = { h:2, min:78, 
   const usedThis = usedTransfersThisGw(picks);
   const cfg = { ...base };
 
-  // FT assumption for next GW (roll if unused this GW)
-  cfg.ft = (usedThis === 0) ? 2 : 1;
-
-  // Minutes floor — tighten only if fragile
-  cfg.min = (riskyN >= 2) ? 85 : 78;
-
-  // DGW damp stays 0.94 (mild discount on 2nd leg)
-  cfg.damp = 0.94;
-
-  // Hit threshold — tougher if fragile
-  cfg.hit = (riskyN >= 3) ? 6 : 5;
+  cfg.ft = (usedThis === 0) ? 2 : 1;           // FT assumption for next GW
+  cfg.min = (riskyN >= 2) ? 85 : 78;           // tighten if fragile
+  cfg.damp = 0.94;                              // DGW damp
+  cfg.hit = (riskyN >= 3) ? 6 : 5;             // tougher hits if fragile
 
   return cfg;
 }
@@ -207,7 +232,6 @@ function autoTuneSettings({ bootstrap, fixtures, picks }, base = { h:2, min:78, 
 function mkPlanA(rejections){
   const why = [];
   if (Array.isArray(rejections) && rejections.length) {
-    // Summarize top reasons
     const counts = {};
     for (const r of rejections) counts[r.code] = (counts[r.code]||0) + 1;
     const top = Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,3)
@@ -283,29 +307,54 @@ function bestCombo(singles, K, teamCounts, MAX_PER_TEAM, bank, ft){
     if (!best || cand.net > best.net) best = cand;
   }
   if (!best) return mkPlanA(["No affordable/legal combo found."]);
-  // Explain hit acceptance
   if (best.hit>0) best.why = [...(best.why||[]), `Includes -${best.hit} hit; net ${best.net>=0?"+":""}${best.net.toFixed(2)}`];
   return best;
 }
 
-function renderPlan(title, plan){
+function renderPlan(title, plan, teams, nextGW, counts){
   const lines = [];
   lines.push(`<b>${esc(title)}</b>`);
   if (!plan || !plan.moves || !plan.moves.length) {
     lines.push("• Save FT. Projected ΔScore: +0.00");
   } else {
     plan.moves.forEach((m,i)=>{
-      lines.push(`• ${i+1}) OUT: ${esc(m.outName)} (${esc(m.outTeam)}) → IN: ${esc(m.inName)} (${esc(m.inTeam)})`);
+      const inTag  = fixtureBadgeForTeam(m.inTeamId, nextGW, counts);
+      const outTag = fixtureBadgeForTeam(m.outTeamId, nextGW, counts);
+      lines.push(`• ${i+1}) OUT: ${esc(m.outName)} (${esc(m.outTeam)}) ${outTag} → IN: ${esc(m.inName)} (${esc(m.inTeam)}) ${inTag}`);
       lines.push(`   ΔScore: +${m.delta.toFixed(2)} | Price: ${m.priceDiff>=0?"+":""}${gbp(m.priceDiff)} | Bank left: ${gbp(m.bankLeft)}`);
+      // NEW: show list vs sell price
+      lines.push(`   Prices: OUT sell ${gbp(m.outSell)} | IN list ${gbp(m.inPrice)}`);
     });
     lines.push(`Net (after hits): ${(plan.net>=0?"+":"")}${plan.net.toFixed(2)}  |  Raw Δ: +${plan.delta.toFixed(2)}  |  Hits: -${plan.hit}`);
   }
-  // WHY block
   if (Array.isArray(plan.why) && plan.why.length){
     lines.push("Why:");
     plan.why.slice(0,6).forEach(w => lines.push(`   • ${esc(w)}`));
   }
   return lines.join("\n");
+}
+
+/* ---------- DGW/Blank helpers ---------- */
+function gwFixtureCounts(fixtures, gw){
+  const map = {};
+  for (const f of (fixtures||[])) {
+    if (f.event !== gw) continue;
+    map[f.team_h] = (map[f.team_h]||0) + 1;
+    map[f.team_a] = (map[f.team_a]||0) + 1;
+  }
+  return map;
+}
+function badgeLine(dgwCount, blankCount){
+  const parts = [];
+  if (dgwCount>0) parts.push(`[DGW:${dgwCount}]`);
+  if (blankCount>0) parts.push(`[BLANK:${blankCount}]`);
+  return parts.length ? `• ${parts.join(" ")}` : "";
+}
+function fixtureBadgeForTeam(teamId, gw, counts){
+  const c = counts?.[teamId] || 0;
+  if (c > 1)  return "(DGW)";
+  if (c === 0) return "(Blank)";
+  return "";
 }
 
 /* ---------- reasons helpers ---------- */
@@ -351,7 +400,6 @@ function rowForHorizon(el, fixtures, teams, startGw, H = 1, damp = 0.94, minCut 
   }
   return { score };
 }
-
 function fdrMult(fdr){
   const x = Math.max(2, Math.min(5, Number(fdr)||3));
   return 1.30 - 0.10 * x; // easy → ~1.10, hard → ~0.80
