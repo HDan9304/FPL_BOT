@@ -8,7 +8,6 @@ export async function send(env, chat_id, text, parse_mode = null) {
       headers: { "content-type": "application/json; charset=utf-8" },
       body: JSON.stringify(payload)
     });
-    // If parse_mode fails for any reason, retry plain text
     const j = await r.json().catch(() => null);
     if (!r.ok || j?.ok === false) {
       await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -17,7 +16,5 @@ export async function send(env, chat_id, text, parse_mode = null) {
         body: JSON.stringify({ chat_id, text })
       });
     }
-  } catch {
-    // Silent fail
-  }
+  } catch {}
 }
