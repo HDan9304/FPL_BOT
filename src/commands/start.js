@@ -1,13 +1,23 @@
 import { send } from "../utils/telegram.js";
-import { ascii, esc, B } from "../utils/fmt.js";
+import { esc } from "../utils/fmt.js";
 
-export default async function start(env, chatId, msg) {
-  const first = ascii((msg?.from?.first_name || "there").trim());
+const B = (s) => `<b>${esc(s)}</b>`;
+
+export default async function start(env, chatId, from) {
+  const first = (from?.first_name || "there").trim();
   const html = [
-    `<b>${esc(`Hey ${first}!`)}</b>`,
+    `${B(`Hey ${first}!`)}`,
     "",
-    `${B("Link your team")}`,
-    `Use <code>/link &lt;team_id&gt;</code> (find it in the FPL URL like <code>/entry/1234567/</code>).`
+    `${B("What I can do now")}`,
+    "• <code>/link &lt;TeamID&gt;</code> — save your FPL team",
+    "• <code>/unlink</code> — forget the saved team",
+    "",
+    `${B("Where to find Team ID")}`,
+    "Open <u>fantasy.premierleague.com</u> → My Team (URL shows <code>/entry/1234567/</code>)",
+    "",
+    `${B("Example")}`,
+    "<code>/link 1234567</code>"
   ].join("\n");
+
   await send(env, chatId, html, "HTML");
 }
