@@ -7,10 +7,7 @@ import linkCmd from "./commands/link.js";
 import unlinkCmd from "./commands/unlink.js";
 
 function text(s, status = 200) {
-  return new Response(s, {
-    status,
-    headers: { "content-type": "text/plain; charset=utf-8" }
-  });
+  return new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 }
 
 function parseCmd(msg) {
@@ -28,7 +25,7 @@ export default {
     // health
     if (req.method === "GET" && (path === "" || path === "/")) return text("OK");
 
-    // init webhook
+    // register webhook (unchanged)
     if (req.method === "GET" && path === "/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method: "POST",
@@ -44,35 +41,41 @@ export default {
       return text(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, j?.ok ? 200 : 500);
     }
 
+    // NEW: register tappable commands in Telegram client
+    if (req.method === "GET" && path === "/init-commands") {
+      const payload = {
+        commands: [
+          { command: "start",  description: "Show help & how to link" },
+          { command: "link",   description: "Link your FPL team (e.g. /link 1234567)" },
+          { command: "unlink", description: "Forget the saved team" }
+        ]
+      };
+      const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setMyCommands`, {
+        method: "POST",
+        headers: { "content-type": "application/json; charset=utf-8" },
+        body: JSON.stringify(payload)
+      });
+      const j = await r.json().catch(() => ({}));
+      return text(j?.ok ? "commands set" : `failed: ${j?.description || "unknown"}`, j?.ok ? 200 : 500);
+    }
+
     // webhook
     if (path === "/webhook/telegram") {
       if (req.method !== "POST") return text("Method Not Allowed", 405);
       if (req.headers.get("x-telegram-bot-api-secret-token") !== env.TELEGRAM_WEBHOOK_SECRET) return text("Forbidden", 403);
 
-      let update;
-      try { update = await req.json(); } catch { return text("OK"); }
-
+      let update; try { update = await req.json(); } catch { return text("OK"); }
       const msg = update?.message;
       if (!msg?.chat?.id) return text("OK");
 
       const chatId = msg.chat.id;
       const { name } = parseCmd(msg);
 
-      if (name === "start" || name === "") {
-        await startCmd(env, chatId, msg.from);
-        return text("OK");
-      }
-      if (name === "link" || name === "linkteam") {
-        await linkCmd(env, chatId, msg);
-        return text("OK");
-      }
-      if (name === "unlink") {
-        await unlinkCmd(env, chatId);
-        return text("OK");
-      }
+      if (name === "start" || name === "") { await startCmd(env, chatId, msg.from); return text("OK"); }
+      if (name === "link"  || name === "linkteam") { await linkCmd(env, chatId, msg); return text("OK"); }
+      if (name === "unlink") { await unlinkCmd(env, chatId); return text("OK"); }
 
-      // fallback -> show start
-      await startCmd(env, chatId, msg.from);
+      await startCmd(env, chatId, msg.from); // fallback
       return text("OK");
     }
 
