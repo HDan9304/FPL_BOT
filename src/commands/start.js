@@ -1,3 +1,4 @@
+// src/commands/start.js
 import { send } from "../utils/telegram.js";
 import { esc } from "../utils/fmt.js";
 
@@ -11,8 +12,9 @@ export default async function start(env, chatId, from) {
     `${B("What I can do now")}`,
     "• /link  — save your FPL team",
     "• /unlink — forget the saved team",
-    "• /transfer — ranked upgrades for next GW",
+    "• /transfer — next-GW plans (Auto Pro)",
     "• /plan — apply best plan and suggest formation",
+    "• /chip — chip planner (Auto Pro)"      // <— NEW
   ].join("\n");
 
   await send(env, chatId, html, "HTML");
