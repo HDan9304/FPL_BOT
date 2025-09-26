@@ -5,18 +5,20 @@ const B = (s) => `<b>${esc(s)}</b>`;
 
 export default async function start(env, chatId, from) {
   const first = (from?.first_name || "there").trim();
+
+  // NOTE: commands are plain text (no <code>) so Telegram makes them tappable.
   const html = [
     `${B(`Hey ${first}!`)}`,
     "",
-    `${B("What I can do now")}`,
-    "• <code>/link &lt;TeamID&gt;</code> — save your FPL team",
-    "• <code>/unlink</code> — forget the saved team",
+    `${B("Commands")}`,
+    "• /link <TeamID> — save your FPL team",
+    "• /unlink — forget the saved team",
     "",
     `${B("Where to find Team ID")}`,
-    "Open <u>fantasy.premierleague.com</u> → My Team (URL shows <code>/entry/1234567/</code>)",
+    "Open fantasy.premierleague.com → My Team (URL shows /entry/1234567/)",
     "",
     `${B("Example")}`,
-    "<code>/link 1234567</code>"
+    "/link 1234567"
   ].join("\n");
 
   await send(env, chatId, html, "HTML");
