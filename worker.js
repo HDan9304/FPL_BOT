@@ -1,9 +1,9 @@
-// worker.js — minimal bot with deadline reminders
-// Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET
+// worker.js — minimal FPL deadline bot
+// Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, DEFAULT_CHAT_ID
 // KV binding: FPL_BOT_KV (stores reminder flags)
 
-const REMINDER_WINDOWS = [24, 2]; // hours before deadline
-const TOLERANCE_HOURS = 0.2; // ~12 min tolerance
+const REMINDER_WINDOWS = [24, 2];     // hours before deadline
+const TOLERANCE_HOURS = 0.2;          // ~12 min tolerance
 
 export default {
   async fetch(req, env) {
@@ -11,7 +11,7 @@ export default {
 
     if (req.method==="GET" && (path===""||path==="/")) return text("OK");
 
-    // Register webhook
+    // Register Telegram webhook
     if (req.method==="GET" && path==="/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method:"POST",
@@ -39,6 +39,7 @@ export default {
       const { name } = parseCmd(raw);
       if (name==="start" || name==="") { await handleStart(env, chatId, msg.from); return text("ok"); }
       if (name==="deadline") { await handleDeadline(env, chatId); return text("ok"); }
+      if (name==="dltest") { await runDeadlineSweep(env, true, chatId); return text("ok"); }
 
       await handleStart(env, chatId, msg.from);
       return text("ok");
@@ -47,8 +48,8 @@ export default {
     return text("Not Found",404);
   },
 
-  // Cloudflare Cron trigger will call this
-  async scheduled(event, env, ctx) {
+  // Cron trigger
+  async scheduled(_event, env, _ctx) {
     await runDeadlineSweep(env);
   }
 };
@@ -56,7 +57,7 @@ export default {
 /* -------- Handlers -------- */
 async function handleStart(env, chatId, from) {
   const first = ascii((from?.first_name || "there").trim());
-  const msg = `Hey ${first}!\n\nCommands:\n/start — show this message\n/deadline — show next GW deadline\n\nI will also remind you 24h and 2h before the next deadline.`;
+  const msg = `Hey ${first}!\n\nCommands:\n/start — show this message\n/deadline — show next GW deadline\n/dltest — simulate reminder\n\nBot will also remind you 24h & 2h before each deadline.`;
   await send(env, chatId, msg);
 }
 
@@ -80,33 +81,33 @@ async function handleDeadline(env, chatId) {
 }
 
 /* -------- Deadline reminders -------- */
-async function runDeadlineSweep(env) {
+async function runDeadlineSweep(env, isTest=false, forceChat=null) {
   const ev = await nextEvent();
   if (!ev) return;
   const deadline = new Date(ev.deadline_time);
   const hoursTo = (deadline - Date.now()) / 36e5;
 
-  // For demo: only remind a fixed chatId (replace with your ID, or extend to all users later)
-  const chatId = env.DEFAULT_CHAT_ID; // set in wrangler.toml secrets
+  // For now: one chat only (set as secret DEFAULT_CHAT_ID)
+  const chatId = forceChat || env.DEFAULT_CHAT_ID;
 
   for (const T of REMINDER_WINDOWS) {
-    if (Math.abs(hoursTo - T) <= TOLERANCE_HOURS) {
+    if (isTest || Math.abs(hoursTo - T) <= TOLERANCE_HOURS) {
       const flag = `alerted:${chatId}:gw${ev.id}:${T}`;
       if (!(await env.FPL_BOT_KV.get(flag))) {
-        await sendReminder(env, chatId, ev, deadline, T);
-        await env.FPL_BOT_KV.put(flag, "1", { expirationTtl: 60*60*48 }); // expire after 2d
+        await sendReminder(env, chatId, ev, deadline, T, isTest);
+        await env.FPL_BOT_KV.put(flag, "1", { expirationTtl: 60*60*48 });
       }
     }
   }
 }
 
-async function sendReminder(env, chatId, ev, deadline, T) {
+async function sendReminder(env, chatId, ev, deadline, T, isTest) {
   const ms = deadline - Date.now();
   const h = Math.max(0, Math.floor(ms/36e5));
   const m = Math.max(0, Math.floor((ms%36e5)/6e4));
 
   const msg = [
-    `⏰ GW${ev.id} deadline reminder`,
+    `⏰ ${isTest?"[TEST] ":""}GW${ev.id} deadline reminder`,
     `UTC: ${deadline.toISOString().slice(0,16).replace("T"," ")}`,
     "",
     `Countdown: ${h}h ${m}m`,
