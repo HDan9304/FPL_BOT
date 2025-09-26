@@ -1,8 +1,9 @@
 // src/commands/transfer.js — AUTO MODE (Pro preset) + DGW/Blank badges + chase/pos + list vs sell
-// Now shows tuned settings header + "Why (auto)" explanations by default.
+// Usage: /transfer [chase] [pos=DEF]    (args optional; router should pass arg string if available)
 
 import { send } from "../utils/telegram.js";
 import { esc } from "../utils/fmt.js";
+import { autoPreset, PRESETS } from "../presets.js";
 
 const kUser   = (id) => `user:${id}:profile`;
 const B       = (s) => `<b>${esc(s)}</b>`;
@@ -38,20 +39,14 @@ export default async function transfer(env, chatId, arg = "") {
   const nextGW = getNextGwId(bootstrap);
   const curGW  = getCurrentGw(bootstrap);
 
-  // Parse optional args: "chase" & "pos=DEF|MID|FWD|GK"
+  // Args: "chase" & "pos=DEF|MID|FWD|GK"
   const opts = parseArgs(arg);
   const picks  = await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`);
   if (!picks) { await send(env, chatId, "Couldn't fetch your picks (is your team private?)."); return; }
 
-  // Auto-tune (Pro) + “why” notes
-  const tuned = autoTuneSettings({ bootstrap, fixtures, picks });
-  let cfg = tuned.cfg;
-  const whyAuto = [...tuned.why];
-
-  if (opts.chase) { 
-    cfg = { ...cfg, min: Math.min(cfg.min, 75), hit: 4 };
-    whyAuto.push("Chasing mode: min→75, hit→4");
-  }
+  // ---- Auto preset (Pro baseline) + optional chase tweak ----
+  let cfg = autoPreset({ bootstrap, fixtures, picks }, PRESETS.PRO);
+  if (opts.chase) { cfg = { ...cfg, min: Math.min(cfg.min, 75), hit: 4, h: Math.max(cfg.h, 3) }; }
   const focusType = opts.posType;
 
   // bank & roster
@@ -134,7 +129,7 @@ export default async function transfer(env, chatId, arg = "") {
       if (IN.id === out.id) { rejections.push(reason("same-player", out, IN)); continue; }
       if (ownedIds.has(IN.id)) { rejections.push(reason("already-owned", out, IN)); continue; }
 
-      const priceDiff = IN.price - out.sell;     // SELL for OUT, LIST for IN
+      const priceDiff = IN.price - out.sell;     // use SELL for OUT, LIST for IN
       if (priceDiff > bank + 1e-9) { rejections.push(reason("bank", out, IN, { need: priceDiff - bank })); continue; }
 
       const newCountIn = (teamCounts[IN.teamId] || 0) + (IN.teamId === out.teamId ? 0 : 1);
@@ -149,9 +144,9 @@ export default async function transfer(env, chatId, arg = "") {
         outTeamId: out.teamId, inTeamId: IN.teamId,
         outTeam: out.team, inTeam: IN.team,
         pos: out.posT,
-        outSell: out.sell,
-        outList: out.listPrice,
-        inPrice: IN.price,
+        outSell: out.sell,           // SELL price for OUT
+        outList: out.listPrice,      // current list for OUT (info)
+        inPrice: IN.price,           // LIST price for IN
         priceDiff, bankLeft: bank - priceDiff,
         delta,
         why: ["passed: legal, bank ok, Δ≥0.5, minutes ok"]
@@ -188,10 +183,9 @@ export default async function transfer(env, chatId, arg = "") {
   const head = [
     `${B("Team")}: ${esc(entry?.name || "—")} | ${B("GW")}: ${nextGW} — Transfer Plan (Next)`,
     `${B("Bank")}: ${esc(gbp(bank))} | ${B("FT (assumed)")}: ${cfg.ft} | ${B("Hits")}: -4 per extra move`,
-    `${B("Model")}: ${opts.chase ? "Chasing" : "Pro Auto"} — h=${cfg.h}, min=${cfg.min}%, damp=${cfg.damp}, hit≥${cfg.hit}` +
-    (focusType ? ` | ${B("Focus")}: ${posName(focusType)}` : ""),
-    whyAuto.length ? `${B("Why (auto)")}: ${esc(whyAuto.join("; "))}` : ""
-  ].filter(Boolean).join("\n");
+    `${B("Model")}: ${opts.chase ? "Chasing" : "Pro Auto"} — h=${cfg.h}, min=${cfg.min}%, damp=${cfg.damp} | ${B("Hit OK if Net ≥")} ${cfg.hit}` +
+    (focusType ? ` | ${B("Focus")}: ${posName(focusType)}` : "")
+  ].join("\n");
 
   const blocks = [];
   for (const p of plans) {
@@ -221,45 +215,7 @@ function parseArgs(arg){
   return out;
 }
 
-/* ---------- auto tuner (Pro) with WHY ---------- */
-function autoTuneSettings({ bootstrap, fixtures, picks }, base = { h:2, min:80, damp:0.93, ft:1, hit:5 }){
-  const why = [];
-  const riskyN = riskyStartersCount(picks, bootstrap, 80);
-  const usedThis = usedTransfersThisGw(picks);
-  const cfg = { ...base };
-
-  // FT assumption for next GW (rollover)
-  cfg.ft = (usedThis === 0) ? 2 : 1;
-  if (cfg.ft === 2) why.push("FT=2 next GW (rolled)");
-  else why.push("FT=1 next GW (used transfer)");
-
-  // Fragility -> tighten minutes / hits
-  if (riskyN >= 3) {
-    cfg.min = 85; cfg.hit = Math.max(cfg.hit, 6);
-    why.push("Fragile XI (≥3 risky): min→85, hit→6");
-  } else if (riskyN === 2) {
-    cfg.min = Math.max(cfg.min, 82);
-    why.push("Some risk (2 risky): min→82");
-  }
-
-  // Calendar shape (simple read)
-  const nextGW = getNextGwId(bootstrap);
-  const counts = gwFixtureCounts(fixtures, nextGW);
-  const dgw = Object.keys(counts).filter(k => counts[k] > 1).length;
-  const blank = Object.values(counts).filter(c => c === 0).length;
-  if (dgw >= 3) { cfg.h = Math.min(3, Math.max(cfg.h, 3)); cfg.damp = 0.92; why.push("DGW cluster: h→3, damp→0.92"); }
-  if (blank >= 4) { cfg.h = Math.min(3, Math.max(cfg.h, 3)); cfg.hit = Math.max(cfg.hit, 6); why.push("Blanks ahead: h→3, hit→6"); }
-
-  // Clamp
-  cfg.h = Math.max(1, Math.min(4, cfg.h));
-  cfg.min = Math.max(75, Math.min(90, cfg.min));
-  cfg.damp = Math.max(0.88, Math.min(0.98, cfg.damp));
-  cfg.hit = Math.max(3, Math.min(8, cfg.hit));
-
-  return { cfg, why };
-}
-
-/* ---------- planning helpers ---------- */
+/* ---------- planning helpers / unchanged from previous ---------- */
 function mkPlanA(rejections){
   const why = [];
   if (Array.isArray(rejections) && rejections.length) {
@@ -278,7 +234,6 @@ function mkPlanA(rejections){
   }
   return { moves: [], delta: 0, hit: 0, net: 0, why };
 }
-
 function mkPlanB(singles, ft){
   if (!singles.length) return mkPlanA();
   const s = singles[0];
@@ -291,7 +246,6 @@ function mkPlanB(singles, ft){
   if (hit>0) why.push(`-4 applied (1 FT used already)`);
   return { moves:[s], delta: raw, hit, net: raw - hit, why };
 }
-
 function bestCombo(singles, K, teamCounts, MAX_PER_TEAM, bank, ft){
   if (!singles.length || K < 2) return mkPlanA();
 
@@ -341,7 +295,6 @@ function bestCombo(singles, K, teamCounts, MAX_PER_TEAM, bank, ft){
   if (best.hit>0) best.why = [...(best.why||[]), `Includes -${best.hit} hit; net ${best.net>=0?"+":""}${best.net.toFixed(2)}`];
   return best;
 }
-
 function renderPlan(title, plan, teams, nextGW, counts){
   const lines = [];
   lines.push(`<b>${esc(title)}</b>`);
@@ -411,7 +364,7 @@ function humanReasonSummary(code, n){
 function uniq(arr){ return Array.from(new Set(arr)); }
 
 /* ---------- scoring over horizon ---------- */
-function rowForHorizon(el, fixtures, teams, startGw, H = 1, damp = 0.93, minCut = 80){
+function rowForHorizon(el, fixtures, teams, startGw, H = 1, damp = 0.94, minCut = 78){
   const minProb = chance(el); if (minProb < minCut) return { score: 0 };
   const ppg = parseFloat(el.points_per_game || "0") || 0;
   let score = 0;
@@ -433,23 +386,6 @@ function rowForHorizon(el, fixtures, teams, startGw, H = 1, damp = 0.93, minCut 
 function fdrMult(fdr){
   const x = Math.max(2, Math.min(5, Number(fdr)||3));
   return 1.30 - 0.10 * x; // easy → ~1.10, hard → ~0.80
-}
-
-/* ---------- team state signals ---------- */
-function riskyStartersCount(picks, bootstrap, minCut=80){
-  const byId = Object.fromEntries((bootstrap?.elements||[]).map(e=>[e.id,e]));
-  const xi = (picks?.picks||[]).filter(p => (p.position||16) <= 11);
-  let n=0;
-  for (const p of xi){
-    const el = byId[p.element]; if (!el) continue;
-    const mp = parseInt(el.chance_of_playing_next_round ?? "100", 10);
-    if (!Number.isFinite(mp) || mp < minCut) n++;
-  }
-  return n;
-}
-function usedTransfersThisGw(picks){
-  const eh = picks?.entry_history;
-  return (typeof eh?.event_transfers === "number") ? eh.event_transfers : null;
 }
 
 /* ---------- misc utils ---------- */
