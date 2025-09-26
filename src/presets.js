@@ -1,57 +1,54 @@
-// src/presets.js — central presets & auto chooser (Pro Auto)
+// src/presets.js
+// Shared "Auto Pro" tuning for both /transfer and /chip
 
-function riskyStartersCount(picks, bootstrap, minCut = 80) {
-  const byId = Object.fromEntries((bootstrap?.elements || []).map(e => [e.id, e]));
-  const xi = (picks?.picks || []).filter(p => (p.position || 16) <= 11);
-  let n = 0;
-  for (const p of xi) {
+export function chooseAutoConfig({ bootstrap, fixtures, picks }) {
+  // Basic squad health signals
+  const risky = riskyStartersCount(picks, bootstrap, 80); // starters <80% minutes
+  const used  = usedTransfersThisGw(picks);
+
+  // ---- Transfer-facing knobs
+  const ft   = (used === 0 ? 2 : 1);
+  const min  = risky >= 2 ? 85 : 82;       // tighten minutes if fragile
+  const damp = 0.94;                       // DGW 2nd-game damp
+  const h    = 2;                          // short horizon for near-term edges
+  const hit  = risky >= 3 ? 6 : 5;         // allow hits only for bigger gains
+
+  // ---- Chip-facing thresholds (Pro defaults)
+  const chip = {
+    // Bench Boost: need a real bench, not just DGW hype
+    bbBenchEvMin: 16,      // EV threshold for (bench GK + 3 outfield)
+    bbBenchSafeMin: 4,     // at least 4 bench players with mins >= min
+
+    // Triple Captain: reward true captain spikes
+    tcSpikeMin: 2.8,       // captain EV – median(cap EV over horizon)
+    tcCapEvMin: 10.5,      // absolute captain EV floor (helps non-DGW spikes)
+
+    // Free Hit: when pain is high or EV gain is meaningful
+    fhGainMin: 12,         // EV(best XI wk) – EV(my XI wk)
+    fhMyEvMin: 45,         // if your XI EV below this, FH more reasonable
+
+    // Wildcard: rebuild when stress & EV delta justify it
+    wcGainMin: 18,         // (avg next 2–3wks bestXI) – (myXI)
+    wcStressMin: 10,       // stress: 3*risky + (4-benchSafe)+ (8-hardInXI clamped)
+    wcHorizon: 6           // evaluate 6 weeks for WC planning
+  };
+
+  return { ft, min, damp, h, hit, chip, maxPerTeam: 3 };
+}
+
+/* ------------- small helpers used above ------------- */
+function riskyStartersCount(picks, bootstrap, minCut=80){
+  const byId = Object.fromEntries((bootstrap?.elements||[]).map(e=>[e.id,e]));
+  const xi = (picks?.picks||[]).filter(p => (p.position||16) <= 11);
+  let n=0;
+  for (const p of xi){
     const el = byId[p.element]; if (!el) continue;
     const mp = parseInt(el.chance_of_playing_next_round ?? "100", 10);
     if (!Number.isFinite(mp) || mp < minCut) n++;
   }
   return n;
 }
-
-function usedTransfersThisGw(picks) {
+function usedTransfersThisGw(picks){
   const eh = picks?.entry_history;
   return (typeof eh?.event_transfers === "number") ? eh.event_transfers : null;
 }
-
-// Base “Pro Auto” defaults (same behavior you had before we centralized config)
-const PRO_BASE = { name: "Pro Auto", h: 2, min: 78, damp: 0.94, hit: 5 };
-
-/**
- * Choose the auto config (Pro) with light adaptation to squad fragility.
- * @param {{bootstrap: any, fixtures: any, picks: any, entry?: any, mode?: "pro", chase?: boolean}} ctx
- * @returns {{presetName:string, h:number, min:number, damp:number, hit:number, ft:number}}
- */
-export function chooseAutoConfig(ctx) {
-  const { bootstrap, picks, chase = false } = (ctx || {});
-  const cfg = { ...PRO_BASE };
-
-  // FT assumption for next GW: if you haven't used any FT this GW, assume 2 next; else 1.
-  const usedThis = usedTransfersThisGw(picks);
-  cfg.ft = (usedThis === 0) ? 2 : 1;
-
-  // Tighten minutes threshold if you have multiple risky starters
-  const riskyN = riskyStartersCount(picks, bootstrap, 80);
-  if (riskyN >= 2) cfg.min = Math.max(cfg.min, 85);
-
-  // Damp stays gentle for DGW stacking
-  cfg.damp = 0.94;
-
-  // Hits tolerance: stricter if very fragile
-  if (riskyN >= 3) cfg.hit = Math.max(cfg.hit, 6);
-
-  // “Chasing” mode (optional arg) relaxes minutes & lowers hit threshold slightly
-  if (chase) {
-    cfg.min = Math.min(cfg.min, 75);
-    cfg.hit = 4;
-  }
-
-  cfg.presetName = PRO_BASE.name + (chase ? " + Chase" : "");
-  return cfg;
-}
-
-// Also provide a default export for flexibility (import chooseAutoConfig from "...").
-export default { chooseAutoConfig };
