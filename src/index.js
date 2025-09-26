@@ -1,13 +1,12 @@
-// index.js — Cloudflare Worker entry + Telegram webhook router
-// Env: TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, FPL_BOT_KV (KV)
+// src/index.js — entry if you keep the src/ layout
 
-import startCmd    from "./command/start.js";
-import linkCmd     from "./command/link.js";
-import unlinkCmd   from "./command/unlink.js";
-import transferCmd from "./command/transfer.js";
-import planCmd     from "./command/plan.js";
-import chipCmd     from "./command/chip.js";
-import { send }    from "./utils/telegram.js";
+import startCmd    from "../command/start.js";
+import linkCmd     from "../command/link.js";
+import unlinkCmd   from "../command/unlink.js";
+import transferCmd from "../command/transfer.js";
+import planCmd     from "../command/plan.js";
+import chipCmd     from "../command/chip.js";
+import { send }    from "../utils/telegram.js";
 
 const text = (s, status = 200) =>
   new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
@@ -17,10 +16,8 @@ export default {
     const url = new URL(req.url);
     const path = url.pathname.replace(/\/$/, "");
 
-    // Health
     if (req.method === "GET" && (path === "" || path === "/")) return text("OK");
 
-    // Helper: set Telegram webhook to this Worker URL
     if (req.method === "GET" && path === "/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method: "POST",
@@ -36,7 +33,6 @@ export default {
       return text(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, j?.ok ? 200 : 500);
     }
 
-    // Telegram webhook
     if (path === "/webhook/telegram") {
       if (req.method !== "POST") return text("Method Not Allowed", 405);
       if (req.headers.get("x-telegram-bot-api-secret-token") !== env.TELEGRAM_WEBHOOK_SECRET)
@@ -50,7 +46,6 @@ export default {
       const chatId = msg.chat.id;
       const raw = (msg.text || "").trim();
 
-      // Simple command parse
       let cmd = "", arg = "";
       if (raw.startsWith("/")) {
         const sp = raw.indexOf(" ");
@@ -58,7 +53,6 @@ export default {
         arg = sp === -1 ? "" : raw.slice(sp + 1).trim();
       }
 
-      // Route
       try {
         if (!cmd || cmd === "/start")     { await startCmd(env, chatId, msg.from); return text("ok"); }
         if (cmd === "/link")              { await linkCmd(env, chatId, arg);        return text("ok"); }
@@ -66,7 +60,6 @@ export default {
         if (cmd === "/transfer")          { await transferCmd(env, chatId, arg);    return text("ok"); }
         if (cmd === "/plan")              { await planCmd(env, chatId, arg);        return text("ok"); }
         if (cmd === "/chip")              { await chipCmd(env, chatId, arg);        return text("ok"); }
-        // Unknown -> nudge
         await send(env, chatId, "Unknown command. Try /start", "HTML");
         return text("ok");
       } catch (e) {
