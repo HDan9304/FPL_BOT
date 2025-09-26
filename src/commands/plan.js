@@ -1,25 +1,18 @@
-// src/commands/plan.js
-// Suggest best formation for the NEXT GW and annotate Captain (C) & Vice-Captain (VC)
-
+// src/commands/transfer.js
 import { send } from "../utils/telegram.js";
 import { esc } from "../utils/fmt.js";
 
 const B = (s) => `<b>${esc(s)}</b>`;
+const kUser = (id) => `user:${id}:profile`;
+const kPlan = (id) => `plan:${id}:transfers`;
 
-// KV key where /link stored the teamId
-const kUser = (chatId) => `user:${chatId}:profile`;
+export default async function transfer(env, chatId) {
+  // resolve team
+  const prof = safeParse(await env.FPL_BOT_KV.get(kUser(chatId)));
+  const teamId = prof?.teamId;
+  if (!teamId) { await send(env, chatId, `${B("No team linked")} — use /link <team_id>.`, "HTML"); return; }
 
-// ---- Public entry ----
-export default async function plan(env, chatId) {
-  // 1) Resolve linked team
-  const profRaw = env.FPL_BOT_KV ? await env.FPL_BOT_KV.get(kUser(chatId)) : null;
-  const teamId = safeParse(profRaw)?.teamId;
-  if (!teamId) {
-    await send(env, chatId, `${B("No team linked")} — use /link <team_id> first.`, "HTML");
-    return;
-  }
-
-  // 2) Fetch FPL data
+  // fetch data
   const [bootstrap, fixtures] = await Promise.all([
     getJSON("https://fantasy.premierleague.com/api/bootstrap-static/"),
     getJSON("https://fantasy.premierleague.com/api/fixtures/")
@@ -27,172 +20,171 @@ export default async function plan(env, chatId) {
   const curGW  = currentGw(bootstrap);
   const nextGW = nextGwId(bootstrap);
   const picks  = await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`);
-  if (!picks) {
-    await send(env, chatId, `${B("Couldn’t fetch your team")} — is it private?`, "HTML");
-    return;
-  }
+  const entry  = await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/`);
+  if (!picks || !entry) { await send(env, chatId, `${B("Couldn’t fetch your team")} — is it private?`, "HTML"); return; }
 
-  // 3) Build best XI for NEXT GW
-  const xiRes = bestXIForNextGW(picks, bootstrap, fixtures, nextGW);
-  if (!xiRes) {
-    await send(env, chatId, `${B("No valid XI")} — not enough available players for GW${nextGW}.`, "HTML");
-    return;
-  }
+  // compute base bank
+  const bank = deriveBank(entry, picks);
 
-  // 4) Captaincy: pick top-2 by score from chosen XI (C then VC)
-  const rankedXI = xiRes.xi.slice().sort((a,b)=>b.score-a.score);
-  const C  = rankedXI[0];
-  const VC = rankedXI.find(p => p.id !== C.id) || rankedXI[1] || C;
+  // build singles ranked (light heuristic)
+  const scored = rankSingles(picks, bootstrap, fixtures, nextGW);
 
-  // decorate names in the printed XI
-  const tag = (r) => r.id === C.id ? `${r.name} (C)` : (r.id === VC.id ? `${r.name} (VC)` : r.name);
+  const best1 = scored[0] || null;
+  const best2 = bestCombo(scored, picks, bootstrap, fixtures, nextGW, bank, 2);
+  const best3 = bestCombo(scored, picks, bootstrap, fixtures, nextGW, bank, 3);
 
-  // 5) Render
+  // prepare output
   const lines = [];
-  lines.push(`${B(`GW ${nextGW} — Best Formation`)}`);
-  lines.push(`${B("Shape")} ${esc(xiRes.shape)}  |  ${B("Projected XI")} ${esc(xiRes.total.toFixed(1))}`);
-  if (xiRes.relaxed) lines.push(`(Minutes threshold was relaxed to fill 11)`);
+  lines.push(`${B(`GW ${nextGW} — Transfer Planner`)}`);
+  lines.push(`${B("Plan A")} Save (0 FT)`);
   lines.push("");
-  lines.push(B("Captaincy"));
-  lines.push(`• ${esc(C.name)} — ${esc(`${C.pos} ${C.team}`)}  (${fmtScore(C.score)})`);
-  lines.push(`• ${esc(VC.name)} — ${esc(`${VC.pos} ${VC.team}`)}  (${fmtScore(VC.score)})`);
-  lines.push("");
-  lines.push(B("Starters"));
-  lines.push(section("GK", xiRes.xi.filter(x=>x.type===1).map(r=>`• ${esc(tag(r))} — ${esc(`${r.team}`)}`)));
-  lines.push(section("DEF", xiRes.xi.filter(x=>x.type===2).map(r=>`• ${esc(tag(r))} — ${esc(`${r.team}`)}`)));
-  lines.push(section("MID", xiRes.xi.filter(x=>x.type===3).map(r=>`• ${esc(tag(r))} — ${esc(`${r.team}`)}`)));
-  lines.push(section("FWD", xiRes.xi.filter(x=>x.type===4).map(r=>`• ${esc(tag(r))} — ${esc(`${r.team}`)}`)));
-  lines.push("");
-  lines.push(`${B("Bench order")} ${esc(xiRes.benchLine || "—")}`);
+
+  if (best1) {
+    lines.push(`${B("Plan B")} 1 move`);
+    lines.push(`• ${esc(best1.outName)} → ${esc(best1.inName)}  (Δ ${fmt(best1.delta)})`);
+    lines.push("");
+  } else {
+    lines.push(`${B("Plan B")} 1 move`);
+    lines.push("• —");
+    lines.push("");
+  }
+
+  if (best2) {
+    const [a,b]=best2.moves;
+    lines.push(`${B("Plan C")} 2 moves`);
+    lines.push(`• ${esc(a.outName)} → ${esc(a.inName)}  (Δ ${fmt(a.delta)})`);
+    lines.push(`• ${esc(b.outName)} → ${esc(b.inName)}  (Δ ${fmt(b.delta)})`);
+    lines.push("");
+  } else {
+    lines.push(`${B("Plan C")} 2 moves`);
+    lines.push("• —");
+    lines.push("");
+  }
+
+  if (best3) {
+    const [a,b,c]=best3.moves;
+    lines.push(`${B("Plan D")} 3 moves`);
+    lines.push(`• ${esc(a.outName)} → ${esc(a.inName)}  (Δ ${fmt(a.delta)})`);
+    lines.push(`• ${esc(b.outName)} → ${esc(b.inName)}  (Δ ${fmt(b.delta)})`);
+    lines.push(`• ${esc(c.outName)} → ${esc(c.inName)}  (Δ ${fmt(c.delta)})`);
+  } else {
+    lines.push(`${B("Plan D")} 3 moves`);
+    lines.push("• —");
+  }
 
   await send(env, chatId, lines.join("\n"), "HTML");
+
+  // --- persist for /plan ---
+  const payload = {
+    gw: nextGW,
+    savedAt: Date.now(),
+    plans: {
+      B: best1 ? [{ outId: best1.outId, inId: best1.inId }] : [],
+      C: best2 ? best2.moves.map(m=>({ outId:m.outId, inId:m.inId })) : [],
+      D: best3 ? best3.moves.map(m=>({ outId:m.outId, inId:m.inId })) : []
+    }
+  };
+  const ttlSec = secondsUntilDeadline(bootstrap, nextGW) || (48*3600);
+  if (env.FPL_BOT_KV) await env.FPL_BOT_KV.put(kPlan(chatId), JSON.stringify(payload), { expirationTtl: ttlSec });
 }
 
-/* ---------------- helpers ---------------- */
-
-function section(label, arr) {
-  return [`${B(label)}:`, arr.length ? arr.join("\n") : "• —"].join("\n");
-}
-
-function fmtScore(x){ return `${x.toFixed(2)}`; }
-
+/* ------- helpers (same lightweight model you saw before) ------- */
 function safeParse(s){ try { return JSON.parse(s||""); } catch { return null; } }
+async function getJSON(u){ try{ const r=await fetch(u,{cf:{cacheTtl:30,cacheEverything:true}}); if(!r.ok) return null; return r.json(); }catch{return null;} }
+const fmt = (x)=> (x>=0?"+":"") + x.toFixed(2);
 
-async function getJSON(url){
-  try {
-    const r = await fetch(url, { cf:{ cacheTtl: 30, cacheEverything: true }});
-    if (!r.ok) return null;
-    return await r.json();
-  } catch { return null; }
-}
+function currentGw(bootstrap){ const ev=bootstrap?.events||[]; return ev.find(e=>e.is_current)?.id ?? ev.find(e=>e.is_next)?.id ?? ev.find(e=>!e.finished)?.id ?? ev.at(-1)?.id ?? 1; }
+function nextGwId(bootstrap){ const ev=bootstrap?.events||[]; const nxt=ev.find(e=>e.is_next); if(nxt) return nxt.id; const cur=ev.find(e=>e.is_current); if(!cur) return ev.find(e=>!e.finished)?.id ?? ev.at(-1)?.id ?? 1; const i=ev.findIndex(e=>e.id===cur.id); return ev[i+1]?.id ?? cur.id; }
+function secondsUntilDeadline(bootstrap, gw){ const ev=(bootstrap?.events||[]).find(e=>e.id===gw); if(!ev?.deadline_time) return null; const ms=new Date(ev.deadline_time)-new Date(); return Math.max(0, Math.floor(ms/1000)); }
 
-function currentGw(bootstrap){
-  const ev=bootstrap?.events||[];
-  return ev.find(e=>e.is_current)?.id ?? ev.find(e=>e.is_next)?.id ?? ev.find(e=>!e.finished)?.id ?? ev.at(-1)?.id ?? 1;
-}
-function nextGwId(bootstrap){
-  const ev=bootstrap?.events||[];
-  return ev.find(e=>e.is_next)?.id ?? (()=>{ const cur=ev.find(e=>e.is_current); if(!cur) return ev.find(e=>!e.finished)?.id ?? ev.at(-1)?.id ?? 1;
-    const i=ev.findIndex(e=>e.id===cur.id); return ev[i+1]?.id ?? cur.id; })();
-}
-
-// Core scoring (simple, fast, explainable)
-function scorePlayer(el, fixtures, bootstrap, gw){
-  // PPG & form
-  const ppg  = parseFloat(el.points_per_game||"0") || 0;
-  const form = Math.min(parseFloat(el.form||"0")||0, 10);
-
-  // Minutes proxy (flag)
-  const minPct = Number(el.chance_of_playing_next_round ?? 100);
-  const minMult = Math.max(0, Math.min(1, minPct/100));
-
-  // Fixture(s) in GW — support DGW by summing with slight diminishing returns
-  const teamId = el.team;
-  const games = fixtures.filter(f => f.event === gw && (f.team_h===teamId || f.team_a===teamId));
-  if (!games.length) return 0;
-
-  let sum = 0;
-  const damp = [1.0, 0.9, 0.8];
-  for (let i=0;i<games.length;i++){
-    const f = games[i];
-    const home = f.team_h===teamId;
-    const fdr  = home ? (f.team_h_difficulty ?? f.difficulty ?? 3) : (f.team_a_difficulty ?? f.difficulty ?? 3);
-    const fdrMult = 1.30 - 0.10 * clamp(fdr, 2, 5); // easier fixture → bigger multiplier
-    sum += (ppg * fdrMult * minMult) * (1 + 0.02 * form) * (damp[i] ?? 0.75);
-  }
-  return sum;
-}
-
-function clamp(x, a, b){ return Math.max(a, Math.min(b, x)); }
+function teamShort(bootstrap,id){ return bootstrap?.teams?.find(t=>t.id===id)?.short_name||"?"; }
 function posName(t){ return ({1:"GK",2:"DEF",3:"MID",4:"FWD"})[t]||"?"; }
-function teamShort(bootstrap, id){ return bootstrap?.teams?.find(t=>t.id===id)?.short_name || "?"; }
-
-// Build best XI for the next GW by checking common legal shapes
-function bestXIForNextGW(picks, bootstrap, fixtures, gw){
+function minutesPct(el){ return Number(el.chance_of_playing_next_round ?? 100); }
+function ppg(el){ return parseFloat(el.points_per_game||"0")||0; }
+function fdrFor(f, teamId){ const home=f.team_h===teamId; return home?(f.team_h_difficulty??f.difficulty??3):(f.team_a_difficulty??f.difficulty??3); }
+function scoreElNext(el, fixtures, gw){
+  const games = fixtures.filter(f=>f.event===gw && (f.team_h===el.team||f.team_a===el.team));
+  if (!games.length) return 0;
+  const min = Math.max(0, Math.min(1, minutesPct(el)/100));
+  const form = Math.min(parseFloat(el.form||"0")||0, 10);
+  const damp=[1.0,0.9,0.8];
+  let s=0;
+  for (let i=0;i<games.length;i++){
+    const mult = 1.30 - 0.10 * Math.max(2, Math.min(5, fdrFor(games[i], el.team)));
+    s += (ppg(el)*mult*min)*(1+0.02*form)*(damp[i]||0.75);
+  }
+  return s;
+}
+function deriveBank(entry, picks){
+  if (picks?.entry_history?.bank!=null) return picks.entry_history.bank/10;
+  if (entry?.last_deadline_bank!=null) return entry.last_deadline_bank/10;
+  return 0;
+}
+function rankSingles(picks, bootstrap, fixtures, nextGW){
   const byId = Object.fromEntries((bootstrap?.elements||[]).map(e=>[e.id,e]));
-  const squad = (picks?.picks||[]).map(p=>byId[p.element]).filter(Boolean);
+  const my = (picks?.picks||[]).map(p=>byId[p.element]).filter(Boolean);
+  const myIds = new Set(my.map(x=>x.id));
 
-  // Precompute rows with scores for the next GW
-  const rows = squad.map(el => ({
-    id: el.id,
-    type: el.element_type,
-    pos: posName(el.element_type),
-    team: teamShort(bootstrap, el.team),
-    name: el.web_name, // short display name
-    score: scorePlayer(el, fixtures, bootstrap, gw),
-    minPct: Number(el.chance_of_playing_next_round ?? 100)
-  }));
+  const sell = {}; (picks?.picks||[]).forEach(p=>{ const el=byId[p.element]; const raw=p.selling_price ?? p.purchase_price ?? el?.now_cost ?? 0; sell[p.element] = raw/10; });
 
-  const gks  = rows.filter(r=>r.type===1).sort((a,b)=>b.score-a.score);
-  const defs = rows.filter(r=>r.type===2).sort((a,b)=>b.score-a.score);
-  const mids = rows.filter(r=>r.type===3).sort((a,b)=>b.score-a.score);
-  const fwds = rows.filter(r=>r.type===4).sort((a,b)=>b.score-a.score);
+  // candidates pool: best-scored players not already owned, same-pos swaps
+  const pool = (bootstrap?.elements||[]).filter(el => !myIds.has(el.id) && minutesPct(el)>=70)
+                .map(el => ({ el, sc: scoreElNext(el, fixtures, nextGW) }))
+                .sort((a,b)=>b.sc-a.sc).slice(0,400);
 
-  const shapes = [[3,4,3],[3,5,2],[4,4,2],[4,3,3],[4,5,1],[5,3,2],[5,4,1]];
-  const MIN = 0.80; // 80% minutes preferred; we can relax if needed
+  const outScored = my.map(el => ({ el, sc: scoreElNext(el, fixtures, nextGW) }))
+                      .sort((a,b)=>a.sc-b.sc)  // worst first as OUT candidates
+                      .slice(0, 11);
+
+  const best = [];
+  for (const o of outScored) {
+    for (const c of pool) {
+      if (c.el.element_type !== o.el.element_type) continue;
+      const priceDiff = (c.el.now_cost||0)/10 - (sell[o.el.id]||0);
+      const delta = c.sc - o.sc;
+      if (delta <= 0) continue;
+      best.push({
+        outId:o.el.id, inId:c.el.id,
+        outName:o.el.web_name, inName:c.el.web_name,
+        delta, priceDiff
+      });
+      if (best.length>=120) break;
+    }
+  }
+  best.sort((a,b)=>b.delta-a.delta);
+  return best;
+}
+function bestCombo(singles, picks, bootstrap, fixtures, nextGW, bank, K){
+  const byId = Object.fromEntries((bootstrap?.elements||[]).map(e=>[e.id,e]));
+  if (singles.length < K) return null;
+
+  // team counts
+  const counts0 = {};
+  for (const p of (picks?.picks||[])) { const el=byId[p.element]; if(!el) continue; counts0[el.team] = (counts0[el.team]||0)+1; }
 
   let best=null;
+  function* choose(arr,k,start=0,acc=[]){ if(k===0){ yield acc; return; } for(let i=start;i<=arr.length-k;i++) yield* choose(arr,k-1,i+1,[...acc,arr[i]]); }
 
-  for (const [d,m,f] of shapes){
-    const pickGK = () => {
-      const safe = gks.filter(r=>r.minPct>=MIN*100);
-      return (safe[0] || gks[0] || null);
-    };
-    const pickN = (arr, n) => {
-      const safe = arr.filter(r=>r.minPct>=MIN*100).slice(0,n);
-      if (safe.length === n) return { chosen: safe, relaxed: false };
-      const need = n - safe.length;
-      const fill = arr.filter(r=>!safe.includes(r)).slice(0,need);
-      return { chosen: [...safe, ...fill], relaxed: need>0 };
-    };
+  for (const combo of choose(singles, K)) {
+    const outIds=new Set(combo.map(m=>m.outId));
+    const inIds =new Set(combo.map(m=>m.inId));
+    if (outIds.size!==combo.length || inIds.size!==combo.length) continue;
 
-    const GK = pickGK(); if (!GK) continue;
-    const {chosen: D, relaxed: rD} = pickN(defs, d);
-    const {chosen: M, relaxed: rM} = pickN(mids, m);
-    const {chosen: F, relaxed: rF} = pickN(fwds, f);
-    if (D.length<d || M.length<m || F.length<f) continue;
+    // team limits and bank
+    const counts = {...counts0};
+    let price=0, ok=true;
+    for (const m of combo) {
+      const out = byId[m.outId], _in = byId[m.inId];
+      if (!_in || !out) { ok=false; break; }
+      if (_in.team !== out.team) { counts[out.team]--; counts[_in.team]=(counts[_in.team]||0)+1; }
+      price += m.priceDiff;
+    }
+    if (!ok) continue;
+    if (Object.values(counts).some(v=>v>3)) continue;
+    if (price > bank) continue;
 
-    const xi = [GK, ...D, ...M, ...F];
-    const total = xi.reduce((s,r)=>s+r.score,0);
-
-    // Bench: top 3 remaining outfielders + spare GK label
-    const rest = rows.filter(r => !xi.find(x=>x.id===r.id));
-    const outfield = rest.filter(r=>r.type!==1).sort((a,b)=>b.score-a.score);
-    const gk2 = rest.find(r=>r.type===1) || null;
-    const benchLine = [
-      outfield[0] ? `1) ${outfield[0].name} (${outfield[0].pos})` : null,
-      outfield[1] ? `2) ${outfield[1].name} (${outfield[1].pos})` : null,
-      outfield[2] ? `3) ${outfield[2].name} (${outfield[2].pos})` : null,
-      gk2 ? `GK) ${gk2.name}` : null
-    ].filter(Boolean).join(", ");
-
-    const relaxed = rD || rM || rF;
-
-    const cand = { d, m, f, xi, total, benchLine, relaxed };
-    if (!best || total > best.total) best = cand;
+    const delta = combo.reduce((s,m)=>s+m.delta,0);
+    if (!best || delta>best.deltaTotal) best = { moves: combo, deltaTotal: delta };
   }
-
-  if (!best) return null;
-  best.shape = `${best.d}-${best.m}-${best.f}`;
   return best;
 }
