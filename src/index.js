@@ -1,4 +1,5 @@
 import startCmd from "./commands/start.js";
+import transferCmd from "./commands/transfer.js";
 import { parseCmd } from "./utils/fmt.js";
 
 export default {
@@ -6,11 +7,10 @@ export default {
     const url = new URL(req.url);
     const path = url.pathname.replace(/\/$/, "");
 
-    // Health
     if (req.method === "GET" && (path === "" || path === "/"))
       return new Response("OK", { headers: { "content-type": "text/plain; charset=utf-8" } });
 
-    // Set Telegram webhook to this Worker URL
+    // Set Telegram webhook
     if (req.method === "GET" && path === "/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method: "POST",
@@ -24,22 +24,6 @@ export default {
       });
       const j = await r.json().catch(() => ({}));
       return new Response(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, {
-        status: j?.ok ? 200 : 500,
-        headers: { "content-type": "text/plain; charset=utf-8" }
-      });
-    }
-
-    // (Optional) Register /start so it appears in the command menu
-    if (req.method === "GET" && path === "/init-commands") {
-      const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setMyCommands`, {
-        method: "POST",
-        headers: { "content-type": "application/json; charset=utf-8" },
-        body: JSON.stringify({
-          commands: [{ command: "start", description: "Show welcome" }]
-        })
-      });
-      const j = await r.json().catch(() => ({}));
-      return new Response(j?.ok ? "commands set" : `failed: ${j?.description || "unknown"}`, {
         status: j?.ok ? 200 : 500,
         headers: { "content-type": "text/plain; charset=utf-8" }
       });
@@ -61,8 +45,9 @@ export default {
 
       const { name } = parseCmd(raw);
 
-      // Only /start (or empty) — everything funnels to start
-      await startCmd(env, chatId, msg);
+      if (name === "transfer") { await transferCmd(env, chatId); return new Response("ok"); }
+
+      await startCmd(env, chatId, msg); // default to /start
       return new Response("ok");
     }
 
