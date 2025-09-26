@@ -1,117 +1,174 @@
+// src/commands/link.js
 import { send } from "../utils/telegram.js";
-import { esc, B } from "../utils/fmt.js";
-import {
-  getBootstrap, getCurrentGw, getEntry, getPicks,
-  nameShort, teamShort, posName
-} from "../utils/fpl.js";
+import { esc } from "../utils/fmt.js";
 
 const kUser = (id) => `user:${id}:profile`;
+const B     = (s) => `<b>${esc(s)}</b>`;
+const pos   = (t) => ({1:"GK",2:"DEF",3:"MID",4:"FWD"})[t] || "?";
 
-export default async function link(env, chatId, msg) {
-  const parts = (msg?.text || "").trim().split(/\s+/);
-  const idStr = parts[1];
+export default async function link(env, chatId, arg = "") {
+  const raw = (arg || "").trim();
 
-  // No ID -> guide
-  if (!idStr) {
+  // If no ID: show how to find & link
+  if (!raw) {
     const html = [
-      `<b>Link Your FPL Team</b>`,
-      ``,
-      `${B("Find Team ID")} Open fantasy.premierleague.com → My Team (URL shows <code>/entry/1234567/</code>)`,
-      ``,
-      `${B("How to link")}`,
+      `${B("Link Your FPL Team")}`,
+      "",
+      `${B("Find Team ID")} Open fantasy.premierleague.com → My Team (URL contains <code>/entry/1234567/</code>)`,
+      "",
+      `${B("How To Link")}`,
       `<code>/link 1234567</code>`
     ].join("\n");
     await send(env, chatId, html, "HTML");
     return;
   }
 
-  const teamId = Number(idStr);
+  const teamId = Number(raw);
   if (!Number.isInteger(teamId) || teamId <= 0) {
     await send(env, chatId, `${B("Tip")} use a numeric Team ID, e.g. <code>/link 1234567</code>`, "HTML");
     return;
   }
 
-  // Fetch FPL data
-  const [bootstrap, entry] = await Promise.all([getBootstrap(), getEntry(teamId)]);
+  // Validate FPL entry
+  const entry = await fplEntry(teamId);
   if (!entry) {
-    await send(env, chatId, `${B("Not Found")} that Team ID didn’t resolve. Double-check or make your team public.`, "HTML");
+    await send(env, chatId, `${B("Not Found")} that Team ID didn’t resolve. Double-check and try again.`, "HTML");
     return;
   }
-  const gw = getCurrentGw(bootstrap);
-  const picks = await getPicks(teamId, gw);
 
   // Save to KV
   const now = Date.now();
   try {
-    await env.FPL_BOT_KV.put(
-      kUser(chatId),
-      JSON.stringify({ teamId, createdAt: now, updatedAt: now }),
-      { expirationTtl: 60 * 60 * 24 * 365 }
-    );
-  } catch {}
+    await env.FPL_BOT_KV.put(kUser(chatId), JSON.stringify({ teamId, createdAt: now, updatedAt: now }));
+  } catch {
+    await send(env, chatId, "Failed to save link in KV. Check your KV binding (FPL_BOT_KV).");
+    return;
+  }
 
-  // Build output
-  const teamName = entry?.name || "—";
-  const manager = [entry?.player_first_name, entry?.player_last_name].filter(Boolean).join(" ") || "—";
-  const gwPoints = picks?.entry_history?.points ?? picks?.entry_history?.event_points ?? "—";
-  const overallRank = entry?.summary_overall_rank ?? entry?.overall_rank ?? "—";
+  // Try to render a friendly confirmation with current XI + bench
+  const [bootstrap, curGW] = await Promise.all([
+    getJSON("https://fantasy.premierleague.com/api/bootstrap-static/"),
+    getCurrentGwId()
+  ]);
 
-  const byId = Object.fromEntries((bootstrap?.elements || []).map(e => [e.id, e]));
-  const starters = (picks?.picks || []).filter(p => (p.position || 16) <= 11);
-  const bench    = (picks?.picks || []).filter(p => (p.position || 16) > 11).sort((a, b) => a.position - b.position);
-  const isC  = new Set(starters.filter(p => p.is_captain).map(p => p.element));
-  const isVC = new Set(starters.filter(p => p.is_vice_captain).map(p => p.element));
+  let picks = null;
+  if (curGW && Number.isFinite(curGW)) {
+    picks = await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`);
+  }
 
-  const tag = (el) => isC.has(el.id) ? " (C)" : isVC.has(el.id) ? " (VC)" : "";
-  const pEl = (p) => byId[p.element];
+  const teamName = (entry.name || "Team").trim();
+  const mgr = [entry.player_first_name, entry.player_last_name].filter(Boolean).join(" ").trim();
+  const ovr = fmtInt(entry?.summary_overall_rank);
+  const gwp = picks?.entry_history?.points ?? picks?.entry_history?.event_points ?? "—";
 
-  // Grouped XI lines with short names
-  const group = (type) =>
-    starters.map(pEl).filter(el => el && el.element_type === type)
-      .map(el => `• ${esc(nameShort(el))} (${esc(teamShort(bootstrap, el.team))})${esc(tag(el))}`)
-      .join("\n") || "• —";
+  // If we can’t fetch picks, still confirm link with basic info
+  if (!picks || !bootstrap) {
+    const html = [
+      `${B("Linked to:")} ${esc(teamName)}${mgr ? ` (Manager: ${esc(mgr)})` : ""}`,
+      `${B("OVR:")} ${esc(ovr)}  |  ${B("GW Points:")} ${esc(String(gwp))}`,
+      "",
+      esc("Note: I couldn't fetch your XI right now, but the team is linked. Try again in a moment.")
+    ].join("\n");
+    await send(env, chatId, html, "HTML");
+    return;
+  }
 
-  const GK = group(1);
-  const DF = group(2);
-  const MD = group(3);
-  const FW = group(4);
+  // Build XI & Bench with short names
+  const teams = Object.fromEntries((bootstrap?.teams || []).map(t => [t.id, t.short_name]));
+  const els   = Object.fromEntries((bootstrap?.elements || []).map(e => [e.id, e]));
+  const all   = (picks?.picks || []).slice().sort((a,b)=>a.position-b.position);
+  const xi    = all.filter(p => (p.position || 16) <= 11);
+  const bench = all.filter(p => (p.position || 16) > 11);
 
-  // Bench lines: 1/2/3 outfield then GK
-  const benchOut = bench.filter(p => pEl(p)?.element_type !== 1);
-  const benchGk  = bench.find(p => pEl(p)?.element_type === 1);
+  const isC  = new Set(xi.filter(p=>p.is_captain).map(p=>p.element));
+  const isVC = new Set(xi.filter(p=>p.is_vice_captain).map(p=>p.element));
+
+  const short = (el) => {
+    // Prefer FPL web_name for short (e.g., “B. Fernandes” appears as “Fernandes”)
+    // If web_name is long, fall back to initial + surname
+    const w = (el?.web_name || "").trim();
+    const first = (el?.first_name || "").trim();
+    const last  = (el?.second_name || "").trim();
+    if (!first || !last) return w || last || first || "—";
+    const initLast = `${first[0]}. ${last}`;
+    return (w && w.length <= initLast.length) ? w : initLast;
+  };
+
+  const adorn = (el) => {
+    if (isC.has(el.id))  return `${short(el)} (C)`;
+    if (isVC.has(el.id)) return `${short(el)} (VC)`;
+    return short(el);
+  };
+
+  const group = {1:[],2:[],3:[],4:[]};
+  for (const p of xi) {
+    const el = els[p.element]; if (!el) continue;
+    group[el.element_type].push(`• ${esc(adorn(el))} (${esc(teams[el.team] || "?")})`);
+  }
+
   const benchLines = [];
-  if (benchOut[0]) benchLines.push(`• 1) ${esc(nameShort(pEl(benchOut[0])))} (${esc(teamShort(bootstrap, pEl(benchOut[0]).team))}) — ${esc(posName(pEl(benchOut[0]).element_type))}`);
-  if (benchOut[1]) benchLines.push(`• 2) ${esc(nameShort(pEl(benchOut[1])))} (${esc(teamShort(bootstrap, pEl(benchOut[1]).team))}) — ${esc(posName(pEl(benchOut[1]).element_type))}`);
-  if (benchOut[2]) benchLines.push(`• 3) ${esc(nameShort(pEl(benchOut[2])))} (${esc(teamShort(bootstrap, pEl(benchOut[2]).team))}) — ${esc(posName(pEl(benchOut[2]).element_type))}`);
-  if (benchGk)     benchLines.push(`• GK) ${esc(nameShort(pEl(benchGk)))} (${esc(teamShort(bootstrap, pEl(benchGk).team))})`);
+  // First three non-GK as bench 1..3 by their position order
+  const bOut = bench.filter(p => (els[p.element]?.element_type) !== 1);
+  const bGk  = bench.find(p => (els[p.element]?.element_type) === 1);
+  if (bOut[0]) benchLines.push(`• 1) ${esc(short(els[bOut[0].element]))} — ${pos(els[bOut[0].element].element_type)}`);
+  if (bOut[1]) benchLines.push(`• 2) ${esc(short(els[bOut[1].element]))} — ${pos(els[bOut[1].element].element_type)}`);
+  if (bOut[2]) benchLines.push(`• 3) ${esc(short(els[bOut[2].element]))} — ${pos(els[bOut[2].element].element_type)}`);
+  if (bGk)     benchLines.push(`• GK) ${esc(short(els[bGk.element]))}`);
 
   const html = [
-    `<b>Linked to:</b> ${esc(teamName)} (Manager: ${esc(manager)})`,
-    `<b>OVR:</b> ${esc(formatNum(overallRank))}  |  <b>GW Points:</b> ${esc(String(gwPoints))}`,
-    ``,
-    `<b>Current XI:</b>`,
-    ``,
-    `<b>GK:</b>`,
-    GK,
-    ``,
-    `<b>DEF:</b>`,
-    DF,
-    ``,
-    `<b>MID:</b>`,
-    MD,
-    ``,
-    `<b>FWD:</b>`,
-    FW,
-    ``,
-    `<b>Bench:</b>`,
-    benchLines.join("\n") || "• —"
+    `${B("Linked to:")} ${esc(teamName)}${mgr ? ` (Manager: ${esc(mgr)})` : ""}`,
+    `${B("OVR:")} ${esc(ovr)}  |  ${B("GW Points:")} ${esc(String(gwp))}`,
+    "",
+    `${B("Current XI:")}`,
+    "",
+    `${B("GK:")}`,
+    ...(group[1].length ? group[1] : ["• —"]),
+    "",
+    `${B("DEF:")}`,
+    ...(group[2].length ? group[2] : ["• —"]),
+    "",
+    `${B("MID:")}`,
+    ...(group[3].length ? group[3] : ["• —"]),
+    "",
+    `${B("FWD:")}`,
+    ...(group[4].length ? group[4] : ["• —"]),
+    "",
+    `${B("Bench:")}`,
+    ...(benchLines.length ? benchLines : ["• —"])
   ].join("\n");
 
   await send(env, chatId, html, "HTML");
 }
 
-function formatNum(n) {
-  if (n == null || n === "—") return "—";
+/* ---------------- helpers ---------------- */
+async function fplEntry(id) {
+  try {
+    const r = await fetch(`https://fantasy.premierleague.com/api/entry/${id}/`, { signal: AbortSignal.timeout(10000) });
+    if (!r.ok) return null;
+    const j = await r.json().catch(() => null);
+    return (j && typeof j.id === "number") ? j : null;
+  } catch { return null; }
+}
+async function getCurrentGwId() {
+  try {
+    const r = await fetch("https://fantasy.premierleague.com/api/bootstrap-static/", { signal: AbortSignal.timeout(10000) });
+    if (!r.ok) return null;
+    const j = await r.json().catch(() => null);
+    const ev = j?.events || [];
+    const cur = ev.find(e => e.is_current); if (cur) return cur.id;
+    const nxt = ev.find(e => e.is_next);    if (nxt) return nxt.id;
+    const up  = ev.find(e => !e.finished);  return up ? up.id : (ev[ev.length-1]?.id || 1);
+  } catch { return null; }
+}
+async function getJSON(url) {
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    if (!r.ok) return null;
+    return await r.json().catch(() => null);
+  } catch { return null; }
+}
+function fmtInt(n){
   const v = Number(n);
-  return Number.isFinite(v) ? v.toLocaleString("en-GB") : String(n);
+  if (!Number.isFinite(v)) return "—";
+  return v.toLocaleString("en-GB");
 }
