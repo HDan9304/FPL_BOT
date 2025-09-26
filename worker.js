@@ -1,177 +1,184 @@
-// worker.js — v0 minimal, fresh start
-// Env bindings:
-//   Secrets: BOT_TOKEN, WEBHOOK_SECRET
-//   KV: TEAM_KV
+// worker.js — v1 minimal: /start and /linkteam only (clean slate)
+// Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET
+// KV binding: FPL_BOT_KV   (stores user:<chatId>:profile)
 
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
     const path = url.pathname.replace(/\/$/, "");
 
-    // health
-    if (req.method === "GET" && (path === "" || path === "/")) return txt("OK");
+    // Health
+    if (req.method === "GET" && (path === "" || path === "/")) return text("OK");
 
-    // set Telegram webhook (messages only)
+    // Register Telegram webhook (message-only)
     if (req.method === "GET" && path === "/init-webhook") {
-      const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/setWebhook`, {
+      const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
         method: "POST",
         headers: { "content-type": "application/json; charset=utf-8" },
         body: JSON.stringify({
-          url: `${url.origin}/webhook`,
-          secret_token: env.WEBHOOK_SECRET,
+          url: `${url.origin}/webhook/telegram`,
+          secret_token: env.TELEGRAM_WEBHOOK_SECRET,
           allowed_updates: ["message"],
           drop_pending_updates: true
         })
       });
-      const j = await r.json().catch(()=>({}));
-      return txt(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, j?.ok ? 200 : 500);
+      const j = await r.json().catch(() => ({}));
+      return text(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, j?.ok ? 200 : 500);
     }
 
     // Telegram webhook
-    if (path === "/webhook") {
-      if (req.method !== "POST") return txt("Method Not Allowed", 405);
-      if (req.headers.get("x-telegram-bot-api-secret-token") !== env.WEBHOOK_SECRET) return txt("Forbidden", 403);
+    if (path === "/webhook/telegram") {
+      if (req.method !== "POST") return text("Method Not Allowed", 405);
+      if (req.headers.get("x-telegram-bot-api-secret-token") !== env.TELEGRAM_WEBHOOK_SECRET) return text("Forbidden", 403);
 
-      let update; try { update = await req.json(); } catch { return txt("OK"); }
+      let update;
+      try { update = await req.json(); } catch { return text("Bad Request", 400); }
+
       const msg = update?.message;
-      if (!msg?.chat?.id) return txt("OK");
+      if (!msg) return text("ok");
+      const chatId = msg?.chat?.id;
+      const t = (msg?.text || "").trim();
+      if (!chatId) return text("ok");
 
-      const chatId = msg.chat.id;
-      const { cmd, arg } = parseCmd(msg);
+      // ping KV so we know it works
+      await env.FPL_BOT_KV.put(kLastSeen(chatId), String(Date.now()));
 
-      // /start or anything unknown -> help
-      if (!cmd || cmd === "/start" || cmd === "/help") {
+      const { name, args } = parseCmd(t);
+
+      if (name === "start" || name === "") {
         await handleStart(env, chatId, msg.from);
-        return txt("OK");
+        return text("ok");
       }
 
-      if (cmd === "/linkteam") {
-        await handleLinkTeam(env, chatId, arg);
-        return txt("OK");
+      if (name === "linkteam") {
+        await handleLinkTeam(env, chatId, args);
+        return text("ok");
       }
 
-      // fallback: show help
+      // Unknown -> show help
       await handleStart(env, chatId, msg.from);
-      return txt("OK");
+      return text("ok");
     }
 
-    return txt("Not Found", 404);
+    return text("Not Found", 404);
   }
 };
 
 /* ---------- handlers ---------- */
 async function handleStart(env, chatId, from) {
-  const name = ascii((from?.first_name || "there").trim());
+  const first = ascii((from?.first_name || "there").trim());
   const html = [
-    `<b>${esc(`Hey ${name}!`)}</b>`,
+    `<b>${esc(`Hey ${first}!`)}</b>`,
     "",
-    `<b>What I can do now:</b>`,
+    `${B("What I can do now")}`,
     `• <code>/linkteam &lt;YourTeamID&gt;</code> — save your FPL team ID`,
     "",
-    `<b>Where to find Team ID:</b>`,
-    `Open fantasy.premierleague.com → My Team, URL looks like <code>/entry/1234567/</code>`,
+    `${B("Where to find Team ID")}`,
+    `Open fantasy.premierleague.com → My Team, check the URL like <code>/entry/1234567/</code>`,
     "",
-    `<b>Example:</b>`,
+    `${B("Example")}`,
     `<code>/linkteam 1234567</code>`
   ].join("\n");
   await sendHTML(env, chatId, html);
 }
 
-async function handleLinkTeam(env, chatId, arg) {
-  const raw = (arg || "").trim();
-  if (!/^\d+$/.test(raw)) {
+async function handleLinkTeam(env, chatId, args) {
+  const raw = (args[0] || "").trim();
+  if (!raw) {
     const html = [
-      `<b>Link Your FPL Team</b>`,
+      `<b>${esc("Link Your FPL Team")}</b>`,
       "",
-      `<b>Find Team ID:</b> fantasy.premierleague.com → My Team (URL contains <code>/entry/1234567/</code>)`,
+      `${B("Find Team ID")} fantasy.premierleague.com → My Team (URL contains <code>/entry/1234567/</code>)`,
       "",
-      `<b>How To Link:</b>`,
+      `${B("How To Link")}`,
       `<code>/linkteam 1234567</code>`
     ].join("\n");
     await sendHTML(env, chatId, html);
     return;
   }
 
-  const teamId = parseInt(raw, 10);
-  const entry = await fplEntry(teamId);
-  if (!entry) {
-    await sendHTML(env, chatId, `<b>Not Found:</b> that Team ID didn’t resolve. Double-check and try again.`);
+  const teamId = Number(raw);
+  if (!Number.isInteger(teamId) || teamId <= 0) {
+    await sendHTML(env, chatId, `${B("Tip")} use a numeric Team ID, e.g. <code>/linkteam 1234567</code>`);
     return;
   }
 
-  const teamName = ascii(entry.name || "Team");
-  const manager = ascii(`${entry.player_first_name || ""} ${entry.player_last_name || ""}`.trim());
-
-  if (env.TEAM_KV) {
-    await env.TEAM_KV.put(kTeam(chatId), String(teamId), { expirationTtl: 60 * 60 * 24 * 365 });
+  const entry = await fplEntry(teamId);
+  if (!entry) {
+    await sendHTML(env, chatId, `${B("Not Found")} that Team ID didn’t resolve. Double-check and try again.`);
+    return;
   }
 
+  const now = Date.now();
+  await env.FPL_BOT_KV.put(kUser(chatId), JSON.stringify({ teamId, createdAt: now, updatedAt: now }));
+
+  const teamName = ascii(`${entry.name || "Team"}`);
+  const manager = ascii(`${entry.player_first_name || ""} ${entry.player_last_name || ""}`.trim());
+
   const html = [
-    `<b>Team Linked</b> ✅`,
+    `<b>${esc("Team Linked")}</b> ✅`,
     "",
-    `<b>Team:</b> <b>${esc(teamName)}</b>`,
-    manager ? `<b>Manager:</b> ${esc(manager)}` : "",
-    `<b>Team ID:</b> ${esc(String(teamId))}`,
+    `${B("Team")} <b>${esc(teamName)}</b>`,
+    manager ? `${B("Manager")} ${esc(manager)}` : "",
+    `${B("Team ID")} ${esc(String(teamId))}`,
     "",
-    `All set. Next we’ll add <code>/myteam</code> when you’re ready.`
+    esc("Nice. We’re ready to add /myteam and /transfer next.")
   ].filter(Boolean).join("\n");
   await sendHTML(env, chatId, html);
 }
 
-/* ---------- Telegram helpers ---------- */
+/* ---------- telegram helpers ---------- */
 async function sendHTML(env, chat_id, html) {
   const payload = { chat_id, text: html, parse_mode: "HTML", disable_web_page_preview: true };
   try {
-    const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "content-type": "application/json; charset=utf-8" },
-      body: JSON.stringify(payload)
-    });
-    const j = await r.json().catch(()=>null);
-    if (!j?.ok) {
-      // fallback without formatting
-      await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "content-type": "application/json; charset=utf-8" },
-        body: JSON.stringify({ chat_id, text: strip(html) })
-      });
-    }
+    const r = await tg(env, "sendMessage", payload);
+    if (!r?.ok) await tg(env, "sendMessage", { chat_id, text: strip(html) });
   } catch {
-    // last resort
-    await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "content-type": "application/json; charset=utf-8" },
-      body: JSON.stringify({ chat_id, text: strip(html) })
-    });
+    await tg(env, "sendMessage", { chat_id, text: strip(html) });
   }
 }
 
-/* ---------- FPL API ---------- */
+async function tg(env, method, body) {
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: JSON.stringify(body)
+    });
+    return await r.json();
+  } catch { return { ok: false }; }
+}
+
+/* ---------- FPL API (only entry used for now) ---------- */
 async function fplEntry(id) {
   try {
     const r = await fetch(`https://fantasy.premierleague.com/api/entry/${id}/`, { cf: { cacheTtl: 0 } });
     if (!r.ok) return null;
-    const j = await r.json().catch(()=>null);
-    return (j && typeof j.id === "number") ? j : null;
+    const j = await r.json().catch(() => null);
+    if (!j || typeof j.id !== "number") return null;
+    return j;
   } catch { return null; }
 }
 
 /* ---------- utils ---------- */
-const txt = (s, status=200) => new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
+const text = (s, status = 200) =>
+  new Response(s, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 
-function parseCmd(msg) {
-  const raw = (msg.text || msg.caption || "").trim();
-  if (!raw) return { cmd: null, arg: "" };
-  const ent = (msg.entities || msg.caption_entities || []).find(e => e.type === "bot_command" && e.offset === 0);
-  let cmd = null, arg = "";
-  if (ent) { cmd = raw.slice(0, ent.length); arg = raw.slice(ent.length).trim(); }
-  else if (raw.startsWith("/")) { const sp = raw.indexOf(" "); cmd = sp === -1 ? raw : raw.slice(0, sp); arg = sp === -1 ? "" : raw.slice(sp+1).trim(); }
-  if (!cmd) return { cmd: null, arg: "" };
-  cmd = cmd.replace(/@\S+$/, "").toLowerCase();
-  return { cmd, arg };
-}
+const parseCmd = (t) => {
+  if (!t.startsWith("/")) return { name: "", args: [] };
+  const parts = t.split(/\s+/);
+  return { name: parts[0].slice(1).toLowerCase(), args: parts.slice(1) };
+};
 
-const ascii = s => String(s).replace(/[‘’]/g,"'").replace(/[“”]/g,'"').replace(/\u2014|\u2013/g,"-").replace(/\u00A0/g," ");
-const esc   = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-const strip = s => s.replace(/<[^>]+>/g, "");
-const kTeam = chatId => `team:${chatId}`;
+const ascii = (s) => String(s)
+  .replace(/[‘’]/g, "'")
+  .replace(/[“”]/g, '"')
+  .replace(/\u2014|\u2013/g, "-")
+  .replace(/\u00A0/g, " ");
+
+const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const strip = (s) => s.replace(/<[^>]+>/g, "");
+const B = (label) => `<b>${esc(label)}:</b>`;
+
+const kLastSeen = (id) => `chat:${id}:last_seen`;
+const kUser = (id) => `user:${id}:profile`;
