@@ -1,12 +1,15 @@
 import { send } from "../utils/telegram.js";
-import { esc } from "../utils/fmt.js";
 
+// small helper for safe bold
+const esc = (s) => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 const B = (s) => `<b>${esc(s)}</b>`;
 
 export default async function start(env, chatId, from) {
   const first = (from?.first_name || "there").trim();
 
-  // NOTE: commands are plain text (no <code>) so Telegram makes them tappable.
+  // NOTE:
+  // - Commands are plain text (no <code>) so they are tappable.
+  // - We send with parse_mode "HTML" so <b> works.
   const html = [
     `${B(`Hey ${first}!`)}`,
     "",
@@ -21,5 +24,5 @@ export default async function start(env, chatId, from) {
     "/link 1234567"
   ].join("\n");
 
-  await send(env, chatId, html, "HTML");
+  await send(env, chatId, html, "HTML"); // <= ensure HTML parse mode
 }
