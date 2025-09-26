@@ -7,9 +7,8 @@ export default {
     const path = url.pathname.replace(/\/$/, "");
 
     // Health
-    if (req.method === "GET" && (path === "" || path === "/")) {
+    if (req.method === "GET" && (path === "" || path === "/"))
       return new Response("OK", { headers: { "content-type": "text/plain; charset=utf-8" } });
-    }
 
     // Set Telegram webhook to this Worker URL
     if (req.method === "GET" && path === "/init-webhook") {
@@ -24,8 +23,26 @@ export default {
         })
       });
       const j = await r.json().catch(() => ({}));
-      const msg = j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`;
-      return new Response(msg, { status: j?.ok ? 200 : 500, headers: { "content-type": "text/plain; charset=utf-8" } });
+      return new Response(j?.ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, {
+        status: j?.ok ? 200 : 500,
+        headers: { "content-type": "text/plain; charset=utf-8" }
+      });
+    }
+
+    // (Optional) Register /start so it appears in the command menu
+    if (req.method === "GET" && path === "/init-commands") {
+      const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setMyCommands`, {
+        method: "POST",
+        headers: { "content-type": "application/json; charset=utf-8" },
+        body: JSON.stringify({
+          commands: [{ command: "start", description: "Show welcome" }]
+        })
+      });
+      const j = await r.json().catch(() => ({}));
+      return new Response(j?.ok ? "commands set" : `failed: ${j?.description || "unknown"}`, {
+        status: j?.ok ? 200 : 500,
+        headers: { "content-type": "text/plain; charset=utf-8" }
+      });
     }
 
     // Telegram webhook
@@ -43,7 +60,8 @@ export default {
       if (!chatId) return new Response("ok");
 
       const { name } = parseCmd(raw);
-      // Only /start (or empty) is handled; everything else falls back to /start
+
+      // Only /start (or empty) — everything funnels to start
       await startCmd(env, chatId, msg);
       return new Response("ok");
     }
