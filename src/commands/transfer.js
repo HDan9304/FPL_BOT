@@ -1,17 +1,26 @@
-// src/commands/transfer.js — AUTO MODE ONLY
-// Usage: /transfer   (no arguments)
+// src/commands/transfer.js — AUTO MODE (Pro preset)
+// Usage: /transfer
 // Requires: utils/telegram.send, utils/fmt.esc, KV key user:<chatId>:profile
 
 import { send } from "../utils/telegram.js";
 import { esc } from "../utils/fmt.js";
 
-const kUser = (id) => `user:${id}:profile`;
-const B     = (s) => `<b>${esc(s)}</b>`;
-const gbp   = (n) => (n == null ? "—" : `£${Number(n).toFixed(1)}`);
+const kUser   = (id) => `user:${id}:profile`;
+const B       = (s) => `<b>${esc(s)}</b>`;
+const gbp     = (n) => (n == null ? "—" : `£${Number(n).toFixed(1)}`);
 const posName = (t) => ({1:"GK",2:"DEF",3:"MID",4:"FWD"})[t] || "?";
 
-export default async function transfer(env, chatId /* arg is ignored in auto mode */) {
-  // resolve linked team
+/* =======================
+   Pro preset (recommended)
+   ======================= */
+// Noise guards
+const MIN_DELTA_SINGLE = 0.5;  // ignore micro “upgrades”
+const MIN_DELTA_COMBO  = 1.5;  // total raw gain required before hits
+// Scan sizes
+const MAX_POOL_PER_POS = 500;
+const MAX_SINGLE_SCAN  = 500;
+
+export default async function transfer(env, chatId) {
   const pRaw = env.FPL_BOT_KV ? await env.FPL_BOT_KV.get(kUser(chatId)) : null;
   const teamId = pRaw ? (JSON.parse(pRaw).teamId) : null;
   if (!teamId) {
@@ -19,7 +28,6 @@ export default async function transfer(env, chatId /* arg is ignored in auto mod
     return;
   }
 
-  // fetch core data
   const [bootstrap, fixtures, entry] = await Promise.all([
     getJSON("https://fantasy.premierleague.com/api/bootstrap-static/"),
     getJSON("https://fantasy.premierleague.com/api/fixtures/"),
@@ -33,12 +41,9 @@ export default async function transfer(env, chatId /* arg is ignored in auto mod
   const nextGW = getNextGwId(bootstrap);
   const curGW  = getCurrentGw(bootstrap);
   const picks  = await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`);
-  if (!picks) {
-    await send(env, chatId, "Couldn't fetch your picks (is your team private?).");
-    return;
-  }
+  if (!picks) { await send(env, chatId, "Couldn't fetch your picks (is your team private?)."); return; }
 
-  // auto settings from team state
+  // Pro auto-tune
   const cfg = autoTuneSettings({ bootstrap, fixtures, picks });
 
   // bank & roster
@@ -49,11 +54,11 @@ export default async function transfer(env, chatId /* arg is ignored in auto mod
   const els   = Object.fromEntries((bootstrap?.elements || []).map(e => [e.id, e]));
   const teams = Object.fromEntries((bootstrap?.teams || []).map(t => [t.id, t]));
   const allPicks = (picks?.picks || []);
-  const startersP = allPicks.filter(p => (p.position || 16) <= 11);
+  const startersP   = allPicks.filter(p => (p.position || 16) <= 11);
   const startersEls = startersP.map(p => els[p.element]).filter(Boolean);
-  const ownedIds = new Set(allPicks.map(p => p.element));
+  const ownedIds    = new Set(allPicks.map(p => p.element));
 
-  // team counts (per club for ≤3 rule)
+  // team counts (≤3)
   const teamCounts = {};
   for (const p of allPicks) {
     const el = els[p.element]; if (!el) continue;
@@ -68,13 +73,13 @@ export default async function transfer(env, chatId /* arg is ignored in auto mod
     sell[p.element] = (raw / 10.0) || 0;
   }
 
-  // pre-compute horizon score for every element
-  const byRow = {}; // id -> {score}
+  // pre-compute horizon score
+  const byRow = {};
   for (const el of (bootstrap?.elements || [])) {
     byRow[el.id] = rowForHorizon(el, fixtures, teams, nextGW, cfg.h, cfg.damp, cfg.min);
   }
 
-  // OUT candidates = weakest starters across horizon
+  // OUT candidates (weakest starters)
   const outCands = startersEls
     .map(el => ({
       id: el.id,
@@ -104,16 +109,17 @@ export default async function transfer(env, chatId /* arg is ignored in auto mod
       score: r.score
     });
   }
-  Object.values(poolByPos).forEach(arr => arr.sort((a,b)=>b.score-a.score));
+  Object.keys(poolByPos).forEach(k => { poolByPos[k].sort((a,b)=>b.score-a.score); poolByPos[k] = poolByPos[k].slice(0, MAX_POOL_PER_POS); });
 
   // Single-move upgrades
   const singles = [];
+  outer:
   for (const out of outCands) {
     const list = poolByPos[out.posT];
-    for (let i=0; i<list.length && singles.length<400; i++) {
+    for (let i=0; i<list.length && singles.length<MAX_SINGLE_SCAN; i++) {
       const IN = list[i];
       if (IN.id === out.id) continue;
-      if (ownedIds.has(IN.id)) continue; // don't suggest someone you already own
+      if (ownedIds.has(IN.id)) continue;
 
       const priceDiff = IN.price - out.sell;
       if (priceDiff > bank + 1e-9) continue;
@@ -122,7 +128,7 @@ export default async function transfer(env, chatId /* arg is ignored in auto mod
       if (newCountIn > MAX_PER_TEAM) continue;
 
       const delta = IN.score - out.score;
-      if (delta <= 0) continue;
+      if (delta < MIN_DELTA_SINGLE) continue;
 
       singles.push({
         outId: out.id, inId: IN.id,
@@ -134,7 +140,7 @@ export default async function transfer(env, chatId /* arg is ignored in auto mod
         priceDiff, bankLeft: bank - priceDiff,
         delta
       });
-      if (singles.length >= 400) break;
+      if (singles.length >= MAX_SINGLE_SCAN) break outer;
     }
   }
   singles.sort((a,b)=>b.delta-a.delta);
@@ -142,8 +148,8 @@ export default async function transfer(env, chatId /* arg is ignored in auto mod
   // Plans A–D
   const planA = mkPlanA();
   const planB = mkPlanB(singles, cfg.ft);
-  const planC = bestCombo(singles.slice(0, 100), 2, teamCounts, MAX_PER_TEAM, bank, cfg.ft);
-  const planD = bestCombo(singles.slice(0, 120), 3, teamCounts, MAX_PER_TEAM, bank, cfg.ft);
+  const planC = bestCombo(singles.slice(0, 120), 2, teamCounts, MAX_PER_TEAM, bank, cfg.ft);
+  const planD = bestCombo(singles.slice(0, 160), 3, teamCounts, MAX_PER_TEAM, bank, cfg.ft);
 
   const plans = [
     { key:"A", title:"Plan A — 0 transfers", ...planA },
@@ -151,14 +157,16 @@ export default async function transfer(env, chatId /* arg is ignored in auto mod
     { key:"C", title:"Plan C — 2 transfers", ...planC },
     { key:"D", title:"Plan D — 3 transfers", ...planD }
   ];
-  const best = plans.slice().sort((a,b)=> (b.net - a.net) )[0];
-  const recommend = best && best.net >= (best.moves.length > 1 ? cfg.hit : 0) ? best.key : "A";
 
-  // render
+  // choose recommendation
+  const filtered = plans.map(p => ({...p})).filter(p => (p.moves.length <= 1) || (p.net >= cfg.hit));
+  const best = (filtered.length ? filtered : plans).slice().sort((a,b)=> (b.net - a.net) )[0];
+  const recommend = best ? best.key : "A";
+
   const head = [
     `${B("Team")}: ${esc(entry?.name || "—")} | ${B("GW")}: ${nextGW} — Transfer Plan (Next)`,
     `${B("Bank")}: ${esc(gbp(bank))} | ${B("FT (assumed)")}: ${cfg.ft} | ${B("Hits")}: -4 per extra move`,
-    `${B("Model")}: Auto — h=${cfg.h}, min=${cfg.min}%, damp=${cfg.damp} | ${B("Hit OK if Net ≥")} ${cfg.hit}`
+    `${B("Model")}: Pro Auto — h=${cfg.h}, min=${cfg.min}%, damp=${cfg.damp} | ${B("Hit OK if Net ≥")} ${cfg.hit}`
   ].join("\n");
 
   const blocks = [];
@@ -171,30 +179,23 @@ export default async function transfer(env, chatId /* arg is ignored in auto mod
   await send(env, chatId, html, "HTML");
 }
 
-/* ---------- auto tuner ---------- */
-function autoTuneSettings({ bootstrap, fixtures, picks }, base = { h:1, min:80, damp:0.9, ft:1, hit:5 }){
-  const nextGW = getNextGwId(bootstrap);
+/* ---------- auto tuner (Pro) ---------- */
+function autoTuneSettings({ bootstrap, fixtures, picks }, base = { h:2, min:78, damp:0.94, ft:1, hit:5 }){
   const riskyN = riskyStartersCount(picks, bootstrap, 80);
-  const dgwTeams = countDGWWindow(fixtures, nextGW, 3);
-  const swing = fixtureSwingScore(fixtures, bootstrap, nextGW, 3);
   const usedThis = usedTransfersThisGw(picks);
   const cfg = { ...base };
 
-  // FT assumption for next GW (rollover if none used this GW)
+  // FT assumption for next GW (roll if unused this GW)
   cfg.ft = (usedThis === 0) ? 2 : 1;
 
-  // Horizon
-  if (riskyN >= 2 || dgwTeams >= 4 || Math.abs(swing) >= 0.3) cfg.h = 2;
-  else cfg.h = 1;
+  // Minutes floor — tighten only if fragile
+  cfg.min = (riskyN >= 2) ? 85 : 78;
 
-  // Minutes floor
-  cfg.min = riskyN >= 2 ? 85 : 80;
+  // DGW damp stays 0.94 (mild discount on 2nd leg)
+  cfg.damp = 0.94;
 
-  // DGW damp
-  cfg.damp = dgwTeams >= 4 ? 0.92 : 0.90;
-
-  // Hit threshold
-  cfg.hit = riskyN >= 2 ? 6 : 5;
+  // Hit threshold — tougher if fragile
+  cfg.hit = (riskyN >= 3) ? 6 : 5;
 
   return cfg;
 }
@@ -205,7 +206,9 @@ function mkPlanB(singles, ft){
   if (!singles.length) return mkPlanA();
   const s = singles[0];
   const hit = Math.max(0, 1 - ft) * 4;
-  return { moves:[s], delta: s.delta, hit, net: s.delta - hit };
+  const raw = s.delta;
+  if (raw < MIN_DELTA_SINGLE) return mkPlanA();
+  return { moves:[s], delta: raw, hit, net: raw - hit };
 }
 function bestCombo(singles, K, teamCounts, MAX_PER_TEAM, bank, ft){
   if (!singles.length || K < 2) return mkPlanA();
@@ -226,11 +229,12 @@ function bestCombo(singles, K, teamCounts, MAX_PER_TEAM, bank, ft){
     }
     for (const c of Object.values(counts)) if (c > MAX_PER_TEAM) return null;
     if (spend > bank + 1e-9) return null;
+    if (deltaSum < MIN_DELTA_COMBO) return null;
     const hit = Math.max(0, combo.length - ft) * 4;
     return { delta: deltaSum, hit, net: deltaSum - hit, spend };
   }
 
-  const S = Math.min(60, singles.length);
+  const S = Math.min(80, singles.length);
   const base = singles.slice(0, S);
   let best = null;
 
@@ -265,11 +269,10 @@ function renderPlan(title, plan){
 }
 
 /* ---------- scoring over horizon ---------- */
-function rowForHorizon(el, fixtures, teams, startGw, H = 1, damp = 0.9, minCut = 80){
+function rowForHorizon(el, fixtures, teams, startGw, H = 1, damp = 0.94, minCut = 78){
   const minProb = chance(el); if (minProb < minCut) return { score: 0 };
   const ppg = parseFloat(el.points_per_game || "0") || 0;
   let score = 0;
-
   for (let g = startGw; g < startGw + H; g++){
     const fs = fixtures
       .filter(f => f.event === g && (f.team_h===el.team || f.team_a===el.team))
@@ -279,7 +282,7 @@ function rowForHorizon(el, fixtures, teams, startGw, H = 1, damp = 0.9, minCut =
       const home = f.team_h === el.team;
       const fdr = home ? (f.team_h_difficulty ?? f.difficulty ?? 3) : (f.team_a_difficulty ?? f.difficulty ?? 3);
       const mult = fdrMult(fdr);
-      const dampK = idx === 0 ? 1.0 : damp; // 2nd DGW slightly down-weighted
+      const dampK = idx === 0 ? 1.0 : damp;
       score += ppg * (minProb/100) * mult * dampK;
     });
   }
@@ -302,31 +305,6 @@ function riskyStartersCount(picks, bootstrap, minCut=80){
     if (!Number.isFinite(mp) || mp < minCut) n++;
   }
   return n;
-}
-function countDGWWindow(fixtures, gw, span=3){
-  const map = new Map(); // teamId -> matches in window
-  for (const f of fixtures){
-    if (!f.event || f.event < gw || f.event >= gw+span) continue;
-    map.set(f.team_h, (map.get(f.team_h)||0)+1);
-    map.set(f.team_a, (map.get(f.team_a)||0)+1);
-  }
-  let multi=0;
-  for (const [_id, cnt] of map) if (cnt>=4) multi++; // 4+ across 3 GWs ≈ DGW exposure
-  return multi;
-}
-function fixtureSwingScore(fixtures, bootstrap, gw, span=3){
-  const teams = bootstrap?.teams||[];
-  let sum=0, n=0;
-  for (const t of teams){
-    const id=t.id;
-    const cur = fixtures.find(f=>f.event===gw   && (f.team_h===id||f.team_a===id));
-    const nxt = fixtures.find(f=>f.event===gw+1 && (f.team_h===id||f.team_a===id));
-    if (!cur || !nxt) continue;
-    const dCur = cur.team_h===id ? (cur.team_h_difficulty??cur.difficulty??3) : (cur.team_a_difficulty??cur.difficulty??3);
-    const dNxt = nxt.team_h===id ? (nxt.team_h_difficulty??nxt.difficulty??3) : (nxt.team_a_difficulty??nxt.difficulty??3);
-    sum += (dCur - dNxt); n++;
-  }
-  return n ? sum/n : 0; // positive => trend to easier fixtures
 }
 function usedTransfersThisGw(picks){
   const eh = picks?.entry_history;
