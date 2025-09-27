@@ -75,7 +75,6 @@ export default async function transfer(env, chatId, arg = "") {
   }
 
   // 7) Build OUT candidates from your full 15 (XI + bench)
-  //    We include bench; weaker EV naturally appears at the top.
   const squad = annotateSquad(picks.picks, elements, teams, evById);
   const outCands = squad
     .map(r => ({
@@ -205,7 +204,8 @@ export default async function transfer(env, chatId, arg = "") {
   const blocks = [];
   for (const p of plans) {
     const title = p.key === recommend ? `✅ ${p.title} (recommended)` : p.title;
-    blocks.push(renderPlan(title, p, nextGW, countsNext));
+    // pass elements & fixtures so we can explain in football language
+    blocks.push(renderPlan(title, p, nextGW, countsNext, elements, fixtures));
   }
 
   const html = [head, "", ...blocks].join("\n\n");
@@ -248,7 +248,6 @@ function mkPlanB(singles, ft, CFG){
 function bestCombo(singles, K, teamCounts, bank, ft, CFG){
   if (!singles.length || K < 2) return mkPlanA();
 
-  // prune aggressively by the top EV deltas helps speed/quality
   const base = singles;
 
   function validCombo(ms){
@@ -275,9 +274,7 @@ function bestCombo(singles, K, teamCounts, bank, ft, CFG){
     return { invalid:false, delta: deltaSum, hit, net: deltaSum - hit, spend };
   }
 
-  // Enumerate K-combinations of first S singles
   const S = Math.min(90, base.length);
-  const idxs = [...Array(S).keys()];
   let best = null;
 
   function* kComb(k, start=0, acc=[]){
@@ -298,11 +295,12 @@ function bestCombo(singles, K, teamCounts, bank, ft, CFG){
   return best;
 }
 
-function renderPlan(title, plan, nextGW, countsNext){
+/* -------------------- Render (now with HUMAN explanations) -------------------- */
+function renderPlan(title, plan, nextGW, countsNext, elements, fixtures){
   const lines = [];
   lines.push(`<b>${esc(title)}</b>`);
   if (!plan || !plan.moves || !plan.moves.length) {
-    lines.push("• Save FT. Projected Δ: +0.00");
+    lines.push("• Save FT. XI looks fine for this week based on fixtures & minutes.");
   } else {
     plan.moves.forEach((m, i) => {
       const inTag  = fixtureBadgeForTeam(m.inTeamId, countsNext);
@@ -310,14 +308,92 @@ function renderPlan(title, plan, nextGW, countsNext){
       lines.push(`• ${i+1}) OUT: ${esc(m.outName)} (${esc(m.outTeam)}) ${outTag} → IN: ${esc(m.inName)} (${esc(m.inTeam)}) ${inTag}`);
       lines.push(`   Δ: +${m.delta.toFixed(2)} | Price: ${m.priceDiff>=0?"+":""}${gbp(m.priceDiff)} | Bank left: ${gbp(m.bankLeft)}`);
       lines.push(`   Prices: OUT sell ${gbp(m.outSell)} | IN list ${gbp(m.inPrice)}`);
+
+      // NEW: human explanation per swap
+      const human = explainMoveHuman(m, elements, fixtures, nextGW, PRO_CONF.H);
+      if (human) lines.push(`   Why: ${esc(human)}`);
     });
     lines.push(`Net (after hits): ${(plan.net>=0?"+":"")}${plan.net.toFixed(2)} | Raw Δ: +${plan.delta.toFixed(2)} | Hits: -${plan.hit}`);
+
+    // Brief hit note if relevant
+    if (plan.hit > 0) {
+      const note = plan.moves.length === 3
+        ? "Aggressive: three clear upgrades this week; still projects ahead after the -8."
+        : "Aggressive: multiple upgrades this week; still projects ahead after the hit.";
+      lines.push(`Note: ${note}`);
+    }
   }
   if (Array.isArray(plan.why) && plan.why.length){
     lines.push("Why:");
     plan.why.slice(0,6).forEach(w => lines.push(`   • ${esc(w)}`));
   }
   return lines.join("\n");
+}
+
+/* -------------------- Human explanation helpers -------------------- */
+function explainMoveHuman(m, elements, fixtures, startGw, H){
+  const outEl = elements[m.outId];
+  const inEl  = elements[m.inId];
+  if (!outEl || !inEl) return "";
+
+  // Minutes labels
+  const outMin = minutesLabel(minutesProb(outEl));
+  const inMin  = minutesLabel(minutesProb(inEl));
+
+  // Fixtures mood over horizon
+  const outFix = fixturesMood(outEl.team, fixtures, startGw, H);
+  const inFix  = fixturesMood(inEl.team, fixtures, startGw, H);
+
+  // Recent output (simple ppg comparison)
+  const ppgOut = num(outEl.points_per_game);
+  const ppgIn  = num(inEl.points_per_game);
+  const formPhrase =
+    (ppgIn >= ppgOut + 0.4) ? "better recent output" :
+    (ppgIn <= ppgOut - 0.4) ? "recent output similar (not worse)" : "similar recent output";
+
+  const outBits = [];
+  if (outMin === "rotation risk") outBits.push("minutes risk");
+  if (outMin === "major doubt")   outBits.push("injury/doubt");
+  if (outFix.key === "blank")     outBits.push("blank week");
+  if (outFix.key === "tough")     outBits.push("tough fixtures");
+
+  const inBits = [];
+  if (inMin === "nailed")         inBits.push("regular starter");
+  if (inFix.key === "good")       inBits.push("kinder fixtures");
+  if (inFix.key === "double")     inBits.push("Double Gameweek");
+  if (formPhrase.startsWith("better")) inBits.push("hotter form");
+
+  const outTxt = outBits.length ? `replace due to ${outBits.join(" + ")}` : "upgrade the spot";
+  const inTxt  = inBits.length ? `bring in for ${inBits.join(" + ")}` : "more reliable pick";
+
+  return `${m.outName}: ${outTxt}. ${m.inName}: ${inTxt}.`;
+}
+
+function minutesLabel(cp){
+  if (cp >= 90) return "nailed";
+  if (cp >= 70) return "rotation risk";
+  return "major doubt";
+}
+
+function fixturesMood(teamId, fixtures, startGw, H){
+  const diffs = [];
+  for (let g = startGw; g < startGw + Math.max(1, H); g++){
+    const fs = fixturesForTeam(fixtures, g, teamId);
+    if (!fs.length) { diffs.push(999); continue; } // mark blank
+    fs.forEach((f, idx) => {
+      const home = f.team_h === teamId;
+      const fdr  = getFDR(f, home);
+      diffs.push(Number(fdr)||3);
+    });
+  }
+  const n = diffs.length;
+  if (!n || diffs.every(v => v === 999)) return { key:"blank", desc:"blank" };
+  if (n >= 2) return { key:"double", desc:"double" };
+  const vals = diffs.filter(v => v !== 999);
+  const avg = vals.reduce((a,b)=>a+b,0)/vals.length;
+  if (avg <= 2.7) return { key:"good",  desc:"good" };
+  if (avg >= 3.7) return { key:"tough", desc:"tough" };
+  return { key:"mixed", desc:"mixed" };
 }
 
 /* -------------------- EV model -------------------- */
