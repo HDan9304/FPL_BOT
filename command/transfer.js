@@ -1,8 +1,9 @@
-// command/transfer.js — AUTO MODE (Pro preset) + DGW/Blank badges + chase/pos + list vs sell
-// NEW: Auto-include BENCH outs when bank is short or bench players are flagged (low minutes).
+// ./command/transfer.js
+// AUTO MODE (Pro preset) + DGW/Blank badges + chase/pos filter + list vs sell + bench guard + explanations
+// Usage: /transfer [chase] [pos=DEF|MID|FWD|GK]
 
 import { send } from "../utils/telegram.js";
-import { esc } from "../utils/fmt.js";
+import { esc }  from "../utils/fmt.js";
 import { chooseAutoConfig } from "../presets.js";
 
 const kUser   = (id) => `user:${id}:profile`;
@@ -11,21 +12,23 @@ const gbp     = (n) => (n == null ? "—" : `£${Number(n).toFixed(1)}`);
 const posName = (t) => ({1:"GK",2:"DEF",3:"MID",4:"FWD"})[t] || "?";
 const posCodeToType = (s) => ({GK:1,GKP:1,DEF:2,DEFENDER:2,MID:3,MIDF:3,MF:3,FWD:4,FW:4,FORWARD:4}[String(s||"").toUpperCase()]||null);
 
-// Noise guards
+// Noise guards (single & combo)
 const MIN_DELTA_SINGLE = 0.5;  // ignore micro “upgrades”
-const MIN_DELTA_COMBO  = 1.5;  // total raw gain required before hits
+const MIN_DELTA_COMBO  = 1.5;  // raw gain required before hits
 // Scan sizes
 const MAX_POOL_PER_POS = 500;
 const MAX_SINGLE_SCAN  = 500;
 
 export default async function transfer(env, chatId, arg = "") {
-  const pRaw = env.FPL_BOT_KV ? await env.FPL_BOT_KV.get(kUser(chatId)) : null;
+  // 1) Ensure linked
+  const pRaw   = await env.FPL_BOT_KV.get(kUser(chatId)).catch(()=>null);
   const teamId = pRaw ? (JSON.parse(pRaw).teamId) : null;
   if (!teamId) {
-    await send(env, chatId, `${B("Not linked")} Use /link <TeamID> first.\nExample: /link 1234567`, "HTML");
+    await send(env, chatId, `${B("Not linked")} Use /link &lt;TeamID&gt; first.\nExample: <code>/link 1234567</code>`, "HTML");
     return;
   }
 
+  // 2) Fetch data
   const [bootstrap, fixtures, entry] = await Promise.all([
     getJSON("https://fantasy.premierleague.com/api/bootstrap-static/"),
     getJSON("https://fantasy.premierleague.com/api/fixtures/"),
@@ -36,41 +39,46 @@ export default async function transfer(env, chatId, arg = "") {
     return;
   }
 
-  const nextGW = getNextGwId(bootstrap);
   const curGW  = getCurrentGw(bootstrap);
+  const nextGW = getNextGwId(bootstrap);
 
-  // Parse optional args: "chase" & "pos=DEF|MID|FWD|GK"
-  const opts = parseArgs(arg);
-  const picks  = await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`);
+  // Optional args: "chase" & "pos=DEF|MID|FWD|GK"
+  const opts  = parseArgs(arg);
+  const picks = await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`);
   if (!picks) { await send(env, chatId, "Couldn't fetch your picks (is your team private?)."); return; }
 
-  // Pro auto-tune (+ chase override)
-  let cfg = chooseAutoConfig({ bootstrap, fixtures, picks, mode:"transfer" }); // from presets.js
-  if (opts.chase) { cfg = { ...cfg, min: Math.min(cfg.min, 75), hit: 4 }; } // looser, more aggressive
-  const focusType = opts.posType; // if provided, constrain swaps to that position
+  // 3) Pro AUTO config (from presets) — with optional chase override
+  let cfg = chooseAutoConfig({ bootstrap, fixtures, picks, mode: "transfer", chase: !!opts.chase }) || {};
+  // Safe defaults in case presets.js is older
+  cfg = {
+    h: 2, min: 78, damp: 0.94, ft: 1, hit: 5,
+    bench_guard: true, bench_big_delta: 2.0,
+    ...cfg
+  };
+  const focusType = opts.posType || null;
 
-  // bank & roster
+  // 4) Bank & roster state
   const bank =
     (typeof picks?.entry_history?.bank === "number") ? picks.entry_history.bank/10 :
     (typeof entry?.last_deadline_bank === "number") ? entry.last_deadline_bank/10 : 0;
 
   const els   = Object.fromEntries((bootstrap?.elements || []).map(e => [e.id, e]));
   const teams = Object.fromEntries((bootstrap?.teams || []).map(t => [t.id, t]));
-  const allPicks = (picks?.picks || []).slice().sort((a,b)=>a.position-b.position);
+  const allPicks    = (picks?.picks || []);
   const startersP   = allPicks.filter(p => (p.position || 16) <= 11);
-  const benchP      = allPicks.filter(p => (p.position || 16) > 11);
+  const benchP      = allPicks.filter(p => (p.position || 16) >  11);
   const startersEls = startersP.map(p => els[p.element]).filter(Boolean);
   const benchEls    = benchP.map(p => els[p.element]).filter(Boolean);
   const ownedIds    = new Set(allPicks.map(p => p.element));
 
-  // team counts (≤3)
+  // team counts (≤3 per club)
   const teamCounts = {};
   for (const p of allPicks) {
     const el = els[p.element]; if (!el) continue;
     teamCounts[el.team] = (teamCounts[el.team] || 0) + 1;
   }
 
-  // selling prices
+  // selling prices (OUT uses selling_price if available)
   const sell = {};
   for (const p of allPicks) {
     const el = els[p.element];
@@ -78,19 +86,51 @@ export default async function transfer(env, chatId, arg = "") {
     sell[p.element] = (raw / 10.0) || 0;
   }
 
-  // pre-compute horizon score
+  // 5) Pre-compute horizon score for all elements
   const byRow = {};
   for (const el of (bootstrap?.elements || [])) {
     byRow[el.id] = rowForHorizon(el, fixtures, teams, nextGW, cfg.h, cfg.damp, cfg.min);
   }
 
-  // Market pool by position (minutes filter), optionally focus
+  // OUT candidates (weakest starters + optional bench if “big upgrade”), optional focus by position
+  const outCands = [];
+  // starters first
+  for (const el of startersEls) {
+    if (focusType && el.element_type !== focusType) continue;
+    outCands.push({
+      id: el.id, bench: false,
+      name: playerShort(el),
+      posT: el.element_type,
+      teamId: el.team,
+      team: teamShort(teams, el.team),
+      sell: sell[el.id] || ((el.now_cost || 0)/10),
+      listPrice: (el.now_cost || 0)/10,
+      score: byRow[el.id]?.score ?? 0
+    });
+  }
+  // bench candidates (only consider if position matches focus or no focus; will enforce big delta later)
+  for (const el of benchEls) {
+    if (focusType && el.element_type !== focusType) continue;
+    outCands.push({
+      id: el.id, bench: true,
+      name: playerShort(el),
+      posT: el.element_type,
+      teamId: el.team,
+      team: teamShort(teams, el.team),
+      sell: sell[el.id] || ((el.now_cost || 0)/10),
+      listPrice: (el.now_cost || 0)/10,
+      score: byRow[el.id]?.score ?? 0
+    });
+  }
+  outCands.sort((a,b)=>a.score-b.score);
+
+  // Market pool by position (minutes/availability filter), optional focus
   const MAX_PER_TEAM = 3;
   const poolByPos = {1:[],2:[],3:[],4:[]};
   for (const el of (bootstrap?.elements || [])) {
     if (chance(el) < cfg.min) continue;
     if (focusType && el.element_type !== focusType) continue;
-    const r = byRow[el.id] || { score:0 };
+    const r = rowForHorizon(el, fixtures, teams, nextGW, cfg.h, cfg.damp, cfg.min);
     poolByPos[el.element_type].push({
       id: el.id,
       name: playerShort(el),
@@ -103,77 +143,61 @@ export default async function transfer(env, chatId, arg = "") {
   }
   Object.keys(poolByPos).forEach(k => { poolByPos[k].sort((a,b)=>b.score-a.score); poolByPos[k] = poolByPos[k].slice(0, MAX_POOL_PER_POS); });
 
-  // ---------- helper to build OUT candidates ----------
-  const makeOutCands = (includeBench=false) => {
-    const base = (includeBench ? [...startersEls, ...benchEls] : startersEls)
-      .filter(el => !focusType || el.element_type === focusType)
-      .map(el => ({
-        id: el.id,
-        name: playerShort(el),
-        posT: el.element_type,
-        teamId: el.team,
-        team: teamShort(teams, el.team),
-        sell: sell[el.id] || ((el.now_cost || 0)/10),
-        listPrice: (el.now_cost || 0)/10,
-        score: byRow[el.id]?.score ?? 0,
-        minutes: chance(el),
-        isBench: benchEls.some(b=>b.id===el.id)
-      }))
-      .sort((a,b)=> a.score - b.score); // weakest first
-    return base.slice(0, includeBench ? 15 : 11);
-  };
+  // 6) Build single-move candidates with legality/guardrails
+  const singles = [];
+  const rejections = [];
+  outer:
+  for (const out of outCands) {
+    const list = poolByPos[out.posT] || [];
+    for (let i=0; i<list.length && singles.length<MAX_SINGLE_SCAN; i++) {
+      const IN = list[i];
 
-  // ---------- pass 1: starters only ----------
-  let outCands = makeOutCands(false);
-  let passNote = "OUT pool: XI only";
-  let { singles, rejections } = buildSingles(outCands, {
-    poolByPos, ownedIds, teamCounts, bank
-  });
+      if (IN.id === out.id) { rejections.push(reason("same-player", out, IN)); continue; }
+      if (ownedIds.has(IN.id)) { rejections.push(reason("already-owned", out, IN)); continue; }
 
-  // Detect triggers for bench-out inclusion
-  const hasBankShort = rejections.some(r => r.code === "bank");
-  const benchFlagged = benchEls.filter(el => chance(el) < cfg.min).length > 0;
+      const priceDiff = IN.price - out.sell; // pay list for IN, receive sell for OUT
+      if (priceDiff > bank + 1e-9) { rejections.push(reason("bank", out, IN, { need: priceDiff - bank })); continue; }
 
-  // If bank is short OR bench has flags, expand OUT pool with targeted bench outs
-  if (hasBankShort || benchFlagged) {
-    // take the worst bench options by (minutes asc, score asc)
-    const benchTargets = benchEls
-      .map(el => ({
-        id: el.id,
-        name: playerShort(el),
-        posT: el.element_type,
-        teamId: el.team,
-        team: teamShort(teams, el.team),
-        sell: sell[el.id] || ((el.now_cost || 0)/10),
-        listPrice: (el.now_cost || 0)/10,
-        score: byRow[el.id]?.score ?? 0,
-        minutes: chance(el),
-        isBench: true
-      }))
-      .filter(x => x.minutes < cfg.min || x.score <= 0.5) // flagged OR very low projection
-      .sort((a,b)=> (a.minutes-b.minutes) || (a.score-b.score))
-      .slice(0, 5); // cap to keep search fast
+      const newCountIn = (teamCounts[IN.teamId] || 0) + (IN.teamId === out.teamId ? 0 : 1);
+      if (newCountIn > MAX_PER_TEAM) { rejections.push(reason("team-limit", out, IN, { count: newCountIn })); continue; }
 
-    if (benchTargets.length) {
-      // merge (avoid dup)
-      const existing = new Set(outCands.map(o=>o.id));
-      const augmented = [...outCands, ...benchTargets.filter(b=>!existing.has(b.id))];
-      outCands = augmented.sort((a,b)=> a.score - b.score).slice(0, 16);
-      passNote = `OUT pool: XI + bench (${benchTargets.length}) [reason: ${hasBankShort?"bank shortfall":""}${hasBankShort&&benchFlagged?", ":""}${benchFlagged?"bench flags":""}]`;
-      // rebuild singles with augmented OUT pool
-      ({ singles, rejections } = buildSingles(outCands, {
-        poolByPos, ownedIds, teamCounts, bank
-      }));
+      const delta = IN.score - out.score;
+      // base threshold
+      if (delta < MIN_DELTA_SINGLE) { rejections.push(reason("min-delta", out, IN, { delta })); continue; }
+      // extra threshold for bench exits
+      if (cfg.bench_guard && out.bench && delta < (cfg.bench_big_delta || 2.0)) {
+        rejections.push(reason("bench-small", out, IN, { delta }));
+        continue;
+      }
+
+      singles.push({
+        outId: out.id, inId: IN.id,
+        outName: out.name, inName: IN.name,
+        outTeamId: out.teamId, inTeamId: IN.teamId,
+        outTeam: out.team, inTeam: IN.team,
+        pos: out.posT, benchOut: !!out.bench,
+        outSell: out.sell,           // SELL price for OUT
+        outList: out.listPrice,      // current list for OUT (info)
+        inPrice: IN.price,           // LIST price for IN
+        priceDiff, bankLeft: bank - priceDiff,
+        delta,
+        why: [
+          "passed: legal, minutes ok, Δ≥0.5",
+          ...(out.bench ? [`bench-out: Δ≥${(cfg.bench_big_delta||2.0).toFixed(1)}`] : [])
+        ]
+      });
+      if (singles.length >= MAX_SINGLE_SCAN) break outer;
     }
   }
+  singles.sort((a,b)=>b.delta-a.delta);
 
-  // DGW/Blank detector (for the next GW)
+  // 7) DGW/Blank detector (next GW)
   const counts = gwFixtureCounts(fixtures, nextGW);
   const dgwTeams = Object.keys(counts).filter(tid => counts[tid] > 1);
   const blankTeams = Object.keys(teams).filter(tid => (counts[tid] || 0) === 0);
   const badge = badgeLine(dgwTeams.length, blankTeams.length);
 
-  // Plans A–D (with inline WHY)
+  // 8) Plans A–D
   const planA = mkPlanA(rejections);
   const planB = mkPlanB(singles, cfg.ft);
   const planC = bestCombo(singles.slice(0, 120), 2, teamCounts, MAX_PER_TEAM, bank, cfg.ft);
@@ -186,17 +210,18 @@ export default async function transfer(env, chatId, arg = "") {
     { key:"D", title:`Plan D — 3 transfers ${badge}`, ...planD }
   ];
 
-  // choose recommendation
+  // Choose recommendation (ignore hit plans unless net ≥ cfg.hit)
   const filtered = plans.map(p => ({...p})).filter(p => (p.moves.length <= 1) || (p.net >= cfg.hit));
   const best = (filtered.length ? filtered : plans).slice().sort((a,b)=> (b.net - a.net) )[0];
   const recommend = best ? best.key : "A";
 
+  // 9) Render
   const head = [
     `${B("Team")}: ${esc(entry?.name || "—")} | ${B("GW")}: ${nextGW} — Transfer Plan (Next)`,
     `${B("Bank")}: ${esc(gbp(bank))} | ${B("FT (assumed)")}: ${cfg.ft} | ${B("Hits")}: -4 per extra move`,
     `${B("Model")}: ${opts.chase ? "Chasing" : "Pro Auto"} — h=${cfg.h}, min=${cfg.min}%, damp=${cfg.damp} | ${B("Hit OK if Net ≥")} ${cfg.hit}` +
-    (focusType ? ` | ${B("Focus")}: ${posName(focusType)}` : ""),
-    `${B("OUT pool")}: ${esc(passNote)}`
+    (focusType ? ` | ${B("Focus")}: ${posName(focusType)}` : "") +
+    (cfg.bench_guard ? ` | ${B("Bench guard")}: Δ≥${(cfg.bench_big_delta||2.0).toFixed(1)}` : "")
   ].join("\n");
 
   const blocks = [];
@@ -207,49 +232,6 @@ export default async function transfer(env, chatId, arg = "") {
 
   const html = [head, "", ...blocks].join("\n\n");
   await send(env, chatId, html, "HTML");
-}
-
-/* ---------- buildSingles helper (single-move search) ---------- */
-function buildSingles(outCands, ctx){
-  const { poolByPos, ownedIds, teamCounts, bank } = ctx;
-  const singles = [];
-  const rejections = [];
-  outer:
-  for (const out of outCands) {
-    const list = poolByPos[out.posT] || [];
-    for (let i=0; i<list.length && singles.length<MAX_SINGLE_SCAN; i++) {
-      const IN = list[i];
-
-      if (IN.id === out.id)             { rejections.push(reason("same-player", out, IN)); continue; }
-      if (ownedIds.has(IN.id))          { rejections.push(reason("already-owned", out, IN)); continue; }
-
-      const priceDiff = IN.price - out.sell; // SELL for OUT, LIST for IN
-      if (priceDiff > bank + 1e-9)      { rejections.push(reason("bank", out, IN, { need: priceDiff - bank })); continue; }
-
-      const newCountIn = (teamCounts[IN.teamId] || 0) + (IN.teamId === out.teamId ? 0 : 1);
-      if (newCountIn > 3)               { rejections.push(reason("team-limit", out, IN, { count: newCountIn })); continue; }
-
-      const delta = IN.score - out.score;
-      if (delta < MIN_DELTA_SINGLE)     { rejections.push(reason("min-delta", out, IN, { delta })); continue; }
-
-      singles.push({
-        outId: out.id, inId: IN.id,
-        outName: out.name, inName: IN.name,
-        outTeamId: out.teamId, inTeamId: IN.teamId,
-        outTeam: out.team, inTeam: IN.team,
-        pos: out.posT,
-        outSell: out.sell,           // SELL price for OUT
-        outList: out.listPrice,      // current list for OUT (info)
-        inPrice: IN.price,           // LIST price for IN
-        priceDiff, bankLeft: bank - priceDiff,
-        delta,
-        why: [out.isBench ? "OUT from bench to fund/deflag" : "passed: legal, bank ok, Δ≥0.5, minutes ok"]
-      });
-      if (singles.length >= MAX_SINGLE_SCAN) break outer;
-    }
-  }
-  singles.sort((a,b)=>b.delta-a.delta);
-  return { singles, rejections };
 }
 
 /* ---------- parse args ---------- */
@@ -270,13 +252,13 @@ function parseArgs(arg){
   return out;
 }
 
-/* ---------- planning helpers ---------- */
+/* ---------- Plan builders ---------- */
 function mkPlanA(rejections){
   const why = [];
   if (Array.isArray(rejections) && rejections.length) {
     const counts = {};
     for (const r of rejections) counts[r.code] = (counts[r.code]||0) + 1;
-    const top = Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,3)
+    const top = Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,4)
       .map(([code,n]) => humanReasonSummary(code, n));
     if (top.length) {
       why.push("No legal upgrades cleared the bar.");
@@ -293,7 +275,7 @@ function mkPlanA(rejections){
 function mkPlanB(singles, ft){
   if (!singles.length) return mkPlanA();
   const s = singles[0];
-  const hit = Math.max(0, 1 - ft) * 4;
+  const hit = Math.max(0, 1 - (ft||0)) * 4;
   const raw = s.delta;
   if (raw < MIN_DELTA_SINGLE) {
     return { ...mkPlanA(), why: ["Best single was below +0.5."] };
@@ -328,7 +310,7 @@ function bestCombo(singles, K, teamCounts, MAX_PER_TEAM, bank, ft){
     if (spend > bank + 1e-9) return { invalid:true, why:[`Insufficient bank (need ${gbp(spend - bank)})`] };
     if (deltaSum < MIN_DELTA_COMBO) return { invalid:true, why:["Total Δ below +1.5 before hits"] };
 
-    const hit = Math.max(0, combo.length - ft) * 4;
+    const hit = Math.max(0, combo.length - (ft||0)) * 4;
     return { invalid:false, delta: deltaSum, hit, net: deltaSum - hit, spend, why };
   }
 
@@ -364,8 +346,9 @@ function renderPlan(title, plan, teams, nextGW, counts){
       const outTag = fixtureBadgeForTeam(m.outTeamId, nextGW, counts);
       lines.push(`• ${i+1}) OUT: ${esc(m.outName)} (${esc(m.outTeam)}) ${outTag} → IN: ${esc(m.inName)} (${esc(m.inTeam)}) ${inTag}`);
       lines.push(`   ΔScore: +${m.delta.toFixed(2)} | Price: ${m.priceDiff>=0?"+":""}${gbp(m.priceDiff)} | Bank left: ${gbp(m.bankLeft)}`);
-      // show list vs sell price
+      // Show list vs sell price
       lines.push(`   Prices: OUT sell ${gbp(m.outSell)} | IN list ${gbp(m.inPrice)}`);
+      if (m.benchOut) lines.push(`   Note: selling bench player (cleared big-Δ guard)`);
     });
     lines.push(`Net (after hits): ${(plan.net>=0?"+":"")}${plan.net.toFixed(2)}  |  Raw Δ: +${plan.delta.toFixed(2)}  |  Hits: -${plan.hit}`);
   }
@@ -407,6 +390,7 @@ function reason(code, OUT, IN, extra={}){
     "bank":          `Insufficient bank (need ${gbp(extra.need || 0)})`,
     "team-limit":    `Would break per-team limit (max 3)`,
     "min-delta":     `Upgrade below +0.5 (Δ=${(extra.delta??0).toFixed(2)})`,
+    "bench-small":   `Bench sale blocked (Δ below big-upgrade guard)`
   }[code] || "Filtered";
   return { code, text: `${OUT.name} → ${IN.name}: ${m}` };
 }
@@ -416,7 +400,8 @@ function humanReasonSummary(code, n){
     "already-owned":"already-owned targets",
     "bank":"bank shortfall",
     "team-limit":"team limit >3",
-    "min-delta":"Δ below +0.5"
+    "min-delta":"Δ below +0.5",
+    "bench-small":"bench Δ too small"
   }[code] || code;
   return `${label}: ${n}×`;
 }
@@ -436,7 +421,7 @@ function rowForHorizon(el, fixtures, teams, startGw, H = 1, damp = 0.94, minCut 
       const home = f.team_h === el.team;
       const fdr = home ? (f.team_h_difficulty ?? f.difficulty ?? 3) : (f.team_a_difficulty ?? f.difficulty ?? 3);
       const mult = fdrMult(fdr);
-      const dampK = idx === 0 ? 1.0 : damp;
+      const dampK = idx === 0 ? 1.0 : damp; // slight damping for second game in a DGW
       score += ppg * (minProb/100) * mult * dampK;
     });
   }
@@ -448,6 +433,21 @@ function fdrMult(fdr){
 }
 
 /* ---------- team state signals ---------- */
+function chance(el){
+  const v = parseInt(el?.chance_of_playing_next_round ?? "100", 10);
+  return Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : 100;
+}
+function teamShort(teams, id){ return teams[id]?.short_name || "?"; }
+function playerShort(el){
+  const first = (el?.first_name || "").trim();
+  const last  = (el?.second_name || "").trim();
+  const web   = (el?.web_name || "").trim();
+  if (first && last) {
+    const initLast = `${first[0]}. ${last}`;
+    return (web && web.length <= initLast.length) ? web : initLast;
+  }
+  return web || last || first || "—";
+}
 function getCurrentGw(bootstrap){
   const ev = bootstrap?.events || [];
   const cur = ev.find(e => e.is_current); if (cur) return cur.id;
@@ -466,23 +466,6 @@ function getNextGwId(bootstrap){
   }
   const up = ev.find(e => !e.finished);
   return up ? up.id : (ev[ev.length-1]?.id || 1);
-}
-
-/* ---------- misc utils ---------- */
-function chance(el){
-  const v = parseInt(el?.chance_of_playing_next_round ?? "100", 10);
-  return Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : 100;
-}
-function teamShort(teams, id){ return teams[id]?.short_name || "?"; }
-function playerShort(el){
-  const first = (el?.first_name || "").trim();
-  const last  = (el?.second_name || "").trim();
-  const web   = (el?.web_name || "").trim();
-  if (first && last) {
-    const initLast = `${first[0]}. ${last}`;
-    return (web && web.length <= initLast.length) ? web : initLast;
-  }
-  return web || last || first || "—";
 }
 async function getJSON(url){
   try {
