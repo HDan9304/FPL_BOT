@@ -18,12 +18,7 @@ export default async function transfer(env, chatId, arg = "") {
   const userRaw = env.FPL_BOT_KV ? await env.FPL_BOT_KV.get(kUser(chatId)) : null;
   const teamId = userRaw ? (JSON.parse(userRaw).teamId) : null;
   if (!teamId) {
-    await send(
-      env,
-      chatId,
-      `<b>${esc("Not linked")}</b> Use <code>/link &lt;TeamID&gt;</code> first.\nExample: <code>/link 1234567</code>`,
-      "HTML"
-    );
+    await send(env, chatId, `<b>${esc("Not linked")}</b> Use <code>/link &lt;TeamID&gt;</code> first.\nExample: <code>/link 1234567</code>`, "HTML");
     return;
   }
 
@@ -41,9 +36,7 @@ export default async function transfer(env, chatId, arg = "") {
   const curGW  = getCurrentGw(bootstrap);
   const nextGW = getNextGwId(bootstrap);
 
-  const picks  = await getJSON(
-    `https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`
-  );
+  const picks  = await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`);
   if (!picks || !Array.isArray(picks.picks)) {
     await send(env, chatId, "Couldn't fetch your picks (team private or endpoint down).");
     return;
@@ -63,8 +56,8 @@ export default async function transfer(env, chatId, arg = "") {
   const teams    = Object.fromEntries((bootstrap.teams    || []).map(t => [t.id, t]));
   const ownedIds = new Set(picks.picks.map(p => p.element));
 
-  // Counts for next GW — **scheduled fixtures only** to avoid phantom DGWs
-  const countsNext = gwFixtureCounts(fixtures, nextGW, { scheduledOnly: true });
+  // Counts for next GW
+  const countsNext = gwFixtureCounts(fixtures, nextGW);
 
   // EV across all players
   const evById = {};
@@ -75,10 +68,8 @@ export default async function transfer(env, chatId, arg = "") {
   // Squad & OUT candidates (full 15)
   const squad = annotateSquad(picks.picks, elements, teams, evById);
   const outCands = squad
-    .map(r => ({
-      id: r.id, posT: r.posT, name: r.name, teamId: r.teamId, team: r.team,
-      isStarter: r.isStarter, sell: r.sell, listPrice: r.listPrice, ev: r.ev
-    }))
+    .map(r => ({ id:r.id, posT:r.posT, name:r.name, teamId:r.teamId, team:r.team,
+                 isStarter:r.isStarter, sell:r.sell, listPrice:r.listPrice, ev:r.ev }))
     .sort((a,b) => a.ev - b.ev)
     .slice(0, 15);
 
@@ -118,26 +109,17 @@ export default async function transfer(env, chatId, arg = "") {
       if (ownedIds.has(IN.id)) { rejections.push(reason("already-owned", out, IN)); continue; }
 
       const priceDiff = IN.price - out.sell; // pay IN list using OUT sell
-      if (priceDiff > bank + 1e-9) {
-        rejections.push(reason("bank", out, IN, { need: priceDiff - bank }));
-        continue;
-      }
+      if (priceDiff > bank + 1e-9) { rejections.push(reason("bank", out, IN, { need: priceDiff - bank })); continue; }
 
       const newCounts = { ...teamCounts };
       if (IN.teamId !== out.teamId) {
         newCounts[out.teamId] = (newCounts[out.teamId] || 0) - 1;
         newCounts[IN.teamId]  = (newCounts[IN.teamId]  || 0) + 1;
       }
-      if (Object.values(newCounts).some(c => c > 3)) {
-        rejections.push(reason("team-limit", out, IN));
-        continue;
-      }
+      if (Object.values(newCounts).some(c => c > 3)) { rejections.push(reason("team-limit", out, IN)); continue; }
 
       const delta = IN.ev - out.ev;
-      if (delta < PRO_CONF.MIN_DELTA_SINGLE) {
-        rejections.push(reason("min-delta", out, IN, { delta }));
-        continue;
-      }
+      if (delta < PRO_CONF.MIN_DELTA_SINGLE) { rejections.push(reason("min-delta", out, IN, { delta })); continue; }
 
       singles.push({
         outId: out.id, outName: out.name, outTeamId: out.teamId, outTeam: out.team,
@@ -165,8 +147,7 @@ export default async function transfer(env, chatId, arg = "") {
   ];
 
   // Recommendation rule
-  const pickable = plans.map(p=>({...p}))
-    .filter(p => (p.moves.length <= 1) || (p.net >= PRO_CONF.HIT_OK));
+  const pickable = plans.map(p=>({...p})).filter(p => (p.moves.length <= 1) || (p.net >= PRO_CONF.HIT_OK));
   const best = (pickable.length ? pickable : plans).slice().sort((a,b)=> b.net - a.net)[0];
   const recommend = best ? best.key : "A";
 
@@ -180,8 +161,8 @@ export default async function transfer(env, chatId, arg = "") {
   const blocks = [];
   for (const p of plans) {
     const title = p.key === recommend ? `✅ ${p.title} (recommended)` : p.title;
-    // renderPlan can use countsNext to print DGW/Blank badges; we pass fixtures too if it needs more context.
-    blocks.push(renderPlan(title, p, nextGW, countsNext, elements, fixtures, PRO_CONF));
+    // SIMPLE output renderer (passes current bank)
+    blocks.push(renderPlan(title, p, countsNext, bank));
   }
 
   const html = [head, "", ...blocks].join("\n\n");
