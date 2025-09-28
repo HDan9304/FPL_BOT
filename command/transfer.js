@@ -156,7 +156,7 @@ export default async function transfer(env, chatId, arg = "") {
 
   const pickable = plans
     .map(p => ({ ...p }))
-    .filter(p => p.moves.length <= 1 || p.net >= required(p));
+    .filter(p => p.moves.length <= 0 || p.net >= required(p));
 
   const rankNet = (p) => p.net - PRO_CONF.RECO_SOFT_PENALTY * Math.max(0, p.moves.length - 1);
 
@@ -217,3 +217,4 @@ async function getJSON(url){
   } catch { return null; }
 
 }
+
