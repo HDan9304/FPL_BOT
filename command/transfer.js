@@ -18,7 +18,12 @@ export default async function transfer(env, chatId, arg = "") {
   const userRaw = env.FPL_BOT_KV ? await env.FPL_BOT_KV.get(kUser(chatId)) : null;
   const teamId = userRaw ? (JSON.parse(userRaw).teamId) : null;
   if (!teamId) {
-    await send(env, chatId, `<b>${esc("Not linked")}</b> Use <code>/link &lt;TeamID&gt;</code> first.\nExample: <code>/link 1234567</code>`, "HTML");
+    await send(
+      env,
+      chatId,
+      `<b>${esc("Not linked")}</b> Use <code>/link &lt;TeamID&gt;</code> first.\nExample: <code>/link 1234567</code>`,
+      "HTML"
+    );
     return;
   }
 
@@ -36,7 +41,9 @@ export default async function transfer(env, chatId, arg = "") {
   const curGW  = getCurrentGw(bootstrap);
   const nextGW = getNextGwId(bootstrap);
 
-  const picks  = await getJSON(`https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`);
+  const picks  = await getJSON(
+    `https://fantasy.premierleague.com/api/entry/${teamId}/event/${curGW}/picks/`
+  );
   if (!picks || !Array.isArray(picks.picks)) {
     await send(env, chatId, "Couldn't fetch your picks (team private or endpoint down).");
     return;
@@ -68,8 +75,10 @@ export default async function transfer(env, chatId, arg = "") {
   // Squad & OUT candidates (full 15)
   const squad = annotateSquad(picks.picks, elements, teams, evById);
   const outCands = squad
-    .map(r => ({ id:r.id, posT:r.posT, name:r.name, teamId:r.teamId, team:r.team,
-                 isStarter:r.isStarter, sell:r.sell, listPrice:r.listPrice, ev:r.ev }))
+    .map(r => ({
+      id:r.id, posT:r.posT, name:r.name, teamId:r.teamId, team:r.team,
+      isStarter:r.isStarter, sell:r.sell, listPrice:r.listPrice, ev:r.ev
+    }))
     .sort((a,b) => a.ev - b.ev)
     .slice(0, 15);
 
@@ -147,23 +156,25 @@ export default async function transfer(env, chatId, arg = "") {
   ];
 
   // Recommendation rule (more conservative):
-  // 1) Multi-move plans must clear a rising bar: HIT_OK + EXTRA_MOVE_STEP*(moves-1)
-  // 2) When ranking, apply a soft penalty per extra move to break close ties in favour of fewer transfers.
+  // 1) Multi-move plans must clear a rising bar: HIT_OK + HIT_OK_PER_EXTRA*(moves-1)
+  // 2) When ranking, apply a soft penalty per extra move to break close ties.
+
   const required = (p) =>
     (p.moves.length <= 1)
       ? -Infinity
-      : PRO_CONF.HIT_OK + PRO_CONF.EXTRA_MOVE_STEP * (p.moves.length - 1);
+      : PRO_CONF.HIT_OK + PRO_CONF.HIT_OK_PER_EXTRA * (p.moves.length - 1);
 
   const pickable = plans
     .map(p => ({ ...p }))
-    .filter(p => p.moves.length <= 0 || p.net >= required(p));
+    .filter(p => (p.moves.length === 0) || (p.net >= required(p)));
 
-  const rankNet = (p) => p.net - PRO_CONF.RECO_SOFT_PENALTY * Math.max(0, p.moves.length - 1);
+  const rankNet = (p) =>
+    p.net - PRO_CONF.SOFT_PEN_PER_EXTRA * Math.max(0, p.moves.length - 1);
 
-  const considered = pickable.length ? pickable : plans;
+  const considered = pickable.length ? pickable : plans.slice();
   considered.sort((a,b) => rankNet(b) - rankNet(a));
 
-  // Optional final sanity: if best beats the best ≤1-move plan by < 1.0, prefer the ≤1-move plan.
+  // Optional final sanity: if best beats best ≤1-move by <1.0, prefer ≤1-move
   const best = considered[0];
   const bestLite = [...considered].filter(p => p.moves.length <= 1)[0];
   let recommend = best?.key || "A";
@@ -180,7 +191,7 @@ export default async function transfer(env, chatId, arg = "") {
 
   const blocks = [];
   for (const p of plans) {
-    const title = p.key === recommend ? `✅ ${p.title} (recommended)` : p.title;
+    const title = p.key === recommend ? `✅ ${p.title} (recommended${(p.moves?.length||0)>1 ? ", tougher bar applied" : ""})` : p.title;
     // SIMPLE output renderer (passes current bank)
     blocks.push(renderPlan(title, p, countsNext, bank));
   }
@@ -215,6 +226,4 @@ async function getJSON(url){
     if (!r.ok) return null;
     return await r.json().catch(() => null);
   } catch { return null; }
-
 }
-
