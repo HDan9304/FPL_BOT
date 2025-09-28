@@ -1,4 +1,3 @@
-// command/start.js — updated start with /wildcard listed
 import { send } from "../utils/telegram.js";
 import { esc } from "../utils/fmt.js";
 
@@ -6,18 +5,18 @@ const B = (s) => `<b>${esc(s)}</b>`;
 
 export default async function start(env, chatId, from) {
   const first = (from?.first_name || "there").trim();
-
   const html = [
     `${B(`Hey ${first}!`)}`,
     "",
     `${B("What I can do now")}`,
-    "• /link        — save your FPL team",
-    "• /unlink      — forget the saved team",
-    "• /transfer    — get Pro plans (A–D) with simple summary",
-    "• /plan        — best formation & XI per plan (uses /transfer plans)",
-    "• /chip        — simplified Pro advice on when/what chip to use",
-    "• /benchboost  — deep-dive BB readiness (checks Plans A–D)",
-    "• /wildcard    — should you play the Wildcard now?",
+    "• /link — save your FPL team",
+    "• /unlink — forget the saved team",
+    "• /transfer — next-GW plans A–D",
+    "• /plan — best XI/formation per plan",
+    "• /chip — when to use chips (simple)",
+    "• /benchboost — BB helper (plans aware)",
+    "• /wildcard — should you WC (w/ draft if yes)",
+    "• /wcsquad — what-if wildcard draft (no chip used)" // <— NEW
   ].join("\n");
 
   await send(env, chatId, html, "HTML");
