@@ -146,10 +146,30 @@ export default async function transfer(env, chatId, arg = "") {
     { key:"D", title:`Plan D — 3 transfers ${badgeLine(countsNext, teams)}`, ...planD }
   ];
 
-  // Recommendation rule
-  const pickable = plans.map(p=>({...p})).filter(p => (p.moves.length <= 1) || (p.net >= PRO_CONF.HIT_OK));
-  const best = (pickable.length ? pickable : plans).slice().sort((a,b)=> b.net - a.net)[0];
-  const recommend = best ? best.key : "A";
+  // Recommendation rule (more conservative):
+  // 1) Multi-move plans must clear a rising bar: HIT_OK + EXTRA_MOVE_STEP*(moves-1)
+  // 2) When ranking, apply a soft penalty per extra move to break close ties in favour of fewer transfers.
+  const required = (p) =>
+    (p.moves.length <= 1)
+      ? -Infinity
+      : PRO_CONF.HIT_OK + PRO_CONF.EXTRA_MOVE_STEP * (p.moves.length - 1);
+
+  const pickable = plans
+    .map(p => ({ ...p }))
+    .filter(p => p.moves.length <= 1 || p.net >= required(p));
+
+  const rankNet = (p) => p.net - PRO_CONF.RECO_SOFT_PENALTY * Math.max(0, p.moves.length - 1);
+
+  const considered = pickable.length ? pickable : plans;
+  considered.sort((a,b) => rankNet(b) - rankNet(a));
+
+  // Optional final sanity: if best beats the best ≤1-move plan by < 1.0, prefer the ≤1-move plan.
+  const best = considered[0];
+  const bestLite = [...considered].filter(p => p.moves.length <= 1)[0];
+  let recommend = best?.key || "A";
+  if (best && bestLite && best.moves.length > 1) {
+    if (best.net - bestLite.net < 1.0) recommend = bestLite.key;
+  }
 
   // Header + blocks
   const head = [
@@ -195,4 +215,5 @@ async function getJSON(url){
     if (!r.ok) return null;
     return await r.json().catch(() => null);
   } catch { return null; }
+
 }
