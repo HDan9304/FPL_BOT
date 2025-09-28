@@ -242,7 +242,7 @@ function pickBestXI(rows){
   const formations = [
     [3,4,3], [3,5,2],
     [4,4,2], [4,3,3],
-    [4,5,1], [5,2,3]
+    [4,5,1], [5,2,3],
     [5,4,1], [5,3,2]
   ];
 
@@ -355,4 +355,5 @@ function reason(code, OUT, IN){
   }[code] || "Filtered";
   return { code, text: `${OUT.name} → ${IN.name}: ${msg}` };
 }
+
 
