@@ -1,4 +1,4 @@
-// command/start.js — updated start with all available commands listed
+// command/start.js — updated start with /wildcard listed
 import { send } from "../utils/telegram.js";
 import { esc } from "../utils/fmt.js";
 
@@ -17,6 +17,7 @@ export default async function start(env, chatId, from) {
     "• /plan        — best formation & XI per plan (uses /transfer plans)",
     "• /chip        — simplified Pro advice on when/what chip to use",
     "• /benchboost  — deep-dive BB readiness (checks Plans A–D)",
+    "• /wildcard    — should you play the Wildcard now?",
   ].join("\n");
 
   await send(env, chatId, html, "HTML");
