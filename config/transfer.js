@@ -1,15 +1,22 @@
-// config/transfer.js — knobs for the Pro preset used by /transfer
+// config/transfer.js
 export const PRO_CONF = Object.freeze({
-  H: 2,                  // horizon (next GW + one after)
-  MIN_PCT: 80,           // minutes probability cut-off
-  DGW_DAMP: 0.94,        // 2nd+ game damp in DGW
+  H: 2,
+  MIN_PCT: 82,
+  DGW_DAMP: 0.94,
   HOME_BUMP: 1.05,
   AWAY_BUMP: 0.95,
-  HIT_OK: 6,             // only take hits if net ≥ this
-  EXTRA_MOVE_STEP: 1.0,
-  RECO_SOFT_PENALTY: 0.6,
-  MIN_DELTA_SINGLE: 0.5, // ignore tiny upgrades
-  MIN_DELTA_COMBO: 1.7,  // min raw gain for 2–3 moves (pre-hits)
+
+  // Hit/upgrade thresholds
+  HIT_OK: 6,                // base: only take hits if net ≥ this
+  MIN_DELTA_SINGLE: 0.8,    // smallest useful single-move upgrade
+  MIN_DELTA_COMBO: 2.0,     // base raw Δ needed for 2–3 moves (before hits)
+
+  // 🔧 New controls
+  HIT_OK_PER_EXTRA: 1.0,    // raise the bar by +1 for each extra move beyond the first
+  STEP_RAW_PER_EXTRA: 0.6,  // extra raw Δ required for 3rd move (2nd extra)
+  SOFT_PEN_PER_EXTRA: 0.5,  // subtract 0.5 per extra move when comparing plans (recommendation only)
+
+  // Pools/scan
   MAX_POOL_PER_POS: 500,
-  MAX_SINGLE_SCAN: 600,
+  MAX_SINGLE_SCAN: 600
 });
