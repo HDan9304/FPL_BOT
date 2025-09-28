@@ -1,14 +1,13 @@
-// index.js — minimal router (paths use ./command/* and ./utils/*)
-import startCmd    from "./command/start.js";
-import linkCmd     from "./command/link.js";
-import unlinkCmd   from "./command/unlink.js";
-import transferCmd from "./command/transfer.js";
-import planCmd     from "./command/plan.js";
-import chipCmd     from "./command/chip.js";
-import { send }    from "./utils/telegram.js";
+// index.js — Router + Telegram webhook (flat paths: ./command/*, ./utils/*)
+import startCmd     from "./command/start.js";
+import linkCmd      from "./command/link.js";
+import unlinkCmd    from "./command/unlink.js";
+import transferCmd  from "./command/transfer.js";
+import planCmd      from "./command/plan.js";
+import chipCmd      from "./command/chip.js";
+import benchboostCmd from "./command/benchboost.js"; // <-- NEW
 
-// KV keys
-const kLastSeen = (id) => `chat:${id}:last_seen`;
+import { send }     from "./utils/telegram.js";
 
 export default {
   async fetch(req, env) {
@@ -17,13 +16,14 @@ export default {
 
     // health
     if (req.method === "GET" && (path === "" || path === "/")) {
-      return new Response("OK", { status: 200, headers: { "content-type":"text/plain; charset=utf-8" }});
+      return new Response("OK", { headers: { "content-type": "text/plain; charset=utf-8" } });
     }
 
-    // init webhook (message-only)
+    // register webhook (message-only)
     if (req.method === "GET" && path === "/init-webhook") {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
-        method:"POST", headers:{ "content-type":"application/json; charset=utf-8" },
+        method: "POST",
+        headers: { "content-type": "application/json; charset=utf-8" },
         body: JSON.stringify({
           url: `${url.origin}/webhook/telegram`,
           secret_token: env.TELEGRAM_WEBHOOK_SECRET,
@@ -31,10 +31,11 @@ export default {
           drop_pending_updates: true
         })
       });
-      const j = await r.json().catch(()=> ({}));
+      const j = await r.json().catch(() => ({}));
       const ok = j?.ok;
       return new Response(ok ? "webhook set" : `failed: ${j?.description || "unknown"}`, {
-        status: ok ? 200 : 500, headers:{ "content-type":"text/plain; charset=utf-8" }
+        status: ok ? 200 : 500,
+        headers: { "content-type": "text/plain; charset=utf-8" }
       });
     }
 
@@ -45,46 +46,47 @@ export default {
         return new Response("Forbidden", { status: 403 });
       }
 
-      let update; try { update = await req.json(); } catch { return new Response("Bad Request", { status:400 }); }
+      let update;
+      try { update = await req.json(); } catch { return new Response("Bad Request", { status: 400 }); }
+
       const msg = update?.message;
       if (!msg) return new Response("ok");
-
       const chatId = msg?.chat?.id;
       const t = (msg?.text || "").trim();
       if (!chatId) return new Response("ok");
 
-      // ping KV to prove it works
-      if (env.FPL_BOT_KV) await env.FPL_BOT_KV.put(kLastSeen(chatId), String(Date.now()));
+      // KV heartbeat
+      await env.FPL_BOT_KV.put(`chat:${chatId}:last_seen`, String(Date.now()));
 
       const { name, args } = parseCmd(t);
 
-      // core commands
-      if (name === "" || name === "start") { await startCmd(env, chatId, msg.from); return new Response("ok"); }
-      if (name === "link")   { await linkCmd(env, chatId, args); return new Response("ok"); }
-      if (name === "unlink") { await unlinkCmd(env, chatId);     return new Response("ok"); }
+      try {
+        if (name === "" || name === "start") { await startCmd(env, chatId, msg.from); return new Response("ok"); }
+        if (name === "link")   { await linkCmd(env, chatId, args.join(" ")); return new Response("ok"); }
+        if (name === "unlink") { await unlinkCmd(env, chatId); return new Response("ok"); }
+        if (name === "transfer"){ await transferCmd(env, chatId, args.join(" ")); return new Response("ok"); }
+        if (name === "plan")   { await planCmd(env, chatId, args.join(" ")); return new Response("ok"); }
+        if (name === "chip")   { await chipCmd(env, chatId, args.join(" ")); return new Response("ok"); }
+        if (name === "benchboost" || name === "bb") { // <-- NEW alias
+          await benchboostCmd(env, chatId, args.join(" "));
+          return new Response("ok");
+        }
 
-      if (name === "transfer") { await transferCmd(env, chatId, args.join(" ")); return new Response("ok"); }
-
-      // /plan base + convenience aliases that map to a specific plan key
-      if (name === "plan")  { await planCmd(env, chatId, "");            return new Response("ok"); }
-      if (name === "planb") { await planCmd(env, chatId, "B");           return new Response("ok"); }
-      if (name === "planc") { await planCmd(env, chatId, "C");           return new Response("ok"); }
-      if (name === "pland") { await planCmd(env, chatId, "D");           return new Response("ok"); }
-
-      // optional: /chip if you have it
-      if (name === "chip") { await chipCmd(env, chatId, args.join(" ")); return new Response("ok"); }
-
-      // fallback -> help
-      await startCmd(env, chatId, msg.from);
-      return new Response("ok");
+        // unknown -> show /start
+        await startCmd(env, chatId, msg.from);
+        return new Response("ok");
+      } catch (e) {
+        await send(env, chatId, "Something went wrong. Try again in a minute.");
+        return new Response("ok");
+      }
     }
 
-    return new Response("Not Found", { status: 404, headers:{ "content-type":"text/plain; charset=utf-8" }});
+    return new Response("Not Found", { status: 404 });
   }
 };
 
-function parseCmd(t){
-  if (!t.startsWith("/")) return { name:"", args:[] };
+function parseCmd(t) {
+  if (!t.startsWith("/")) return { name: "", args: [] };
   const parts = t.split(/\s+/);
   return { name: parts[0].slice(1).toLowerCase(), args: parts.slice(1) };
 }
