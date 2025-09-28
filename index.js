@@ -1,14 +1,14 @@
 // index.js — Telegram router (HTML-safe replies)
 
-import startCmd     from "./command/start.js";
-import linkCmd      from "./command/link.js";
-import unlinkCmd    from "./command/unlink.js";
-import transferCmd  from "./command/transfer.js";
-import planCmd      from "./command/plan.js";
-import chipCmd      from "./command/chip.js";
+import startCmd      from "./command/start.js";
+import linkCmd       from "./command/link.js";
+import unlinkCmd     from "./command/unlink.js";
+import transferCmd   from "./command/transfer.js";
+import planCmd       from "./command/plan.js";
+import chipCmd       from "./command/chip.js";
 import benchboostCmd from "./command/benchboost.js";
-import wildcardCmd  from "./command/wildcard.js";
-import wcsquadCmd   from "./command/wcsquad.js";   // <— NEW
+import wildcardCmd   from "./command/wildcard.js";
+import wcsquadCmd    from "./command/wcsquad.js";   // <— NEW
 
 import { send } from "./utils/telegram.js";
 
@@ -63,7 +63,14 @@ export default {
         if (name === "link")                  { await linkCmd(env, chatId, args);     return new Response("ok"); }
         if (name === "unlink")                { await unlinkCmd(env, chatId);         return new Response("ok"); }
         if (name === "transfer")              { await transferCmd(env, chatId, args.join(" ")); return new Response("ok"); }
+
+        // Plan family
         if (name === "plan")                  { await planCmd(env, chatId, args.join(" "));     return new Response("ok"); }
+        if (name === "planb")                 { await planCmd(env, chatId, "B");                return new Response("ok"); }
+        if (name === "planc")                 { await planCmd(env, chatId, "C");                return new Response("ok"); }
+        if (name === "pland")                 { await planCmd(env, chatId, "D");                return new Response("ok"); }
+
+        // Chips & extras
         if (name === "chip")                  { await chipCmd(env, chatId);           return new Response("ok"); }
         if (name === "benchboost")            { await benchboostCmd(env, chatId);     return new Response("ok"); }
         if (name === "wildcard")              { await wildcardCmd(env, chatId);       return new Response("ok"); }
