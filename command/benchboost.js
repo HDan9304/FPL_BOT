@@ -1,6 +1,7 @@
 // command/benchboost.js — Simple Bench Boost advisor over Plans A–D
 // Reads live squad, rebuilds the same transfer plans, then shows BB value per plan
 // Output stays simple: Bench EV, Total EV (15), Hits, Net, and a plain “Play BB?” nudge.
+// Now also picks a single top recommendation using the same conservative logic as /transfer.
 
 import { send } from "../utils/telegram.js";
 import { esc }  from "../utils/fmt.js";
@@ -15,6 +16,10 @@ import { mkPlanA, mkPlanB, bestCombo, badgeLine } from "../lib/plan.js";
 
 /* ---------- KV key ---------- */
 const kUser = (id) => `user:${id}:profile`;
+
+// fallbacks if your PRO_CONF doesn’t yet define these (keeps old configs working)
+const EXTRA_MOVE_STEP     = Number.isFinite(PRO_CONF?.EXTRA_MOVE_STEP) ? PRO_CONF.EXTRA_MOVE_STEP : 1.5;
+const RECO_SOFT_PENALTY   = Number.isFinite(PRO_CONF?.RECO_SOFT_PENALTY) ? PRO_CONF.RECO_SOFT_PENALTY : 0.5;
 
 export default async function benchboost(env, chatId, arg = "") {
   // 1) Guard: linked?
@@ -47,7 +52,10 @@ export default async function benchboost(env, chatId, arg = "") {
   }
 
   // 3) Chip availability (simple): BB available if not used in history.chips
-  const bbUsed = Array.isArray(history?.chips) && history.chips.some(c => (c?.name || "").toLowerCase() === "bboost" || (c?.name || "").toLowerCase() === "bench boost");
+  const bbUsed = Array.isArray(history?.chips) && history.chips.some(c => {
+    const n = String(c?.name || "").toLowerCase();
+    return n === "bboost" || n === "bench boost" || n === "benchboost";
+  });
   const bbAvailable = !bbUsed;
 
   // 4) Bank & FT assumption (same rule as /transfer)
@@ -158,7 +166,6 @@ export default async function benchboost(env, chatId, arg = "") {
   // After transfers, if an OUT was on the bench, the IN replaces in that same bench slot.
   const benchIdx = new Set((picks.picks || []).filter(p => (p.position||16) > 11).map(p => p.position));
   function planBenchReport(plan) {
-    // map old element->replacement if moved
     const mapOutToIn = new Map(plan.moves?.map(m => [m.outId, m.inId]) || []);
     let totalEV = 0;
     let benchEV = 0;
@@ -171,24 +178,39 @@ export default async function benchboost(env, chatId, arg = "") {
     }
     const hit = plan.hit || 0;
     const net = (plan.net ?? (plan.delta || 0) - hit);
-    // Simple BB recommendation: good bench AND we aren't taking heavy hits.
+
+    // Simple BB gate: bench must be decent and we don’t want heavy-hit only scenarios
     const playNow =
       bbAvailable &&
-      benchEV >= 12 &&                                  // decent bench
-      (plan.moves.length <= 1 || net >= PRO_CONF.HIT_OK); // don't burn hits just to BB
+      benchEV >= 12 &&
+      (plan.moves.length <= 1 || net >= PRO_CONF.HIT_OK);
 
     return {
       benchEV: round1(benchEV),
       totalEV: round1(totalEV),
       hit,
       net: round1(net),
-      playNow
+      playNow,
+      moves: plan.moves || []
     };
   }
 
-  const reports = plans.map(p => ({ key: p.key, title: p.title, ...planBenchReport(p), moves: p.moves || [] }));
+  const reports = plans.map(p => ({ key: p.key, title: p.title, ...planBenchReport(p) }));
 
-  // 13) Header + blocks (super simple text)
+  // 13) Pick ONE recommendation, mirroring /transfer’s conservative style
+  const needed = (movesLen) =>
+    (movesLen <= 1) ? -Infinity : PRO_CONF.HIT_OK + EXTRA_MOVE_STEP * (movesLen - 1);
+
+  const eligible = reports
+    .map((r, i) => ({ ...r, movesLen: (plans[i].moves || []).length }))
+    .filter(r => !r.playNow ? false : (r.net >= needed(r.movesLen)));
+
+  const rankNet = (r) => r.net - RECO_SOFT_PENALTY * Math.max(0, r.movesLen - 1);
+  const pool = eligible.length ? eligible : []; // if empty, we’ll fall back to “Not this week”
+  pool.sort((a,b) => rankNet(b) - rankNet(a));
+  const best = pool[0];
+
+  // 14) Header + blocks (super simple text)
   const bbLabel = bbAvailable ? "Available ✅" : "Used ❌";
   const head = [
     `<b>${esc("Team")}:</b> ${esc(entry?.name || "—")} | <b>${esc("GW")}:</b> ${nextGW} — Bench Boost Check`,
@@ -197,16 +219,21 @@ export default async function benchboost(env, chatId, arg = "") {
     `<b>${esc("Model")}:</b> Pro (H=${PRO_CONF.H}, min=${PRO_CONF.MIN_PCT}%, damp=${PRO_CONF.DGW_DAMP}, hitOK≥${PRO_CONF.HIT_OK})`
   ].join("\n");
 
-  const blocks = [];
-  for (const r of reports) {
+  const reco = best
+    ? `Recommendation: <b>Play Bench Boost</b> with ${esc(best.key)} (Bench EV ${best.benchEV}, Plan Net ${best.net >= 0 ? "+" : ""}${best.net})`
+    : `Recommendation: <b>Not this week</b> — bench isn’t strong enough or plans require too many moves/hits`;
+
+  const blocks = [reco, ""];
+  for (let i=0; i<reports.length; i++) {
+    const r = reports[i];
+    const plan = plans[i];
     const line1 = `<b>${esc(r.title)}</b>`;
     const line2 = `• Bench EV: ${r.benchEV} | Total EV (15): ${r.totalEV} | Hits: -${r.hit} | Plan Net: ${r.net >= 0 ? "+" : ""}${r.net}`;
     const line3 = r.playNow
-      ? "• Suggestion: <b>Play Bench Boost</b> this GW."
+      ? "• Suggestion: <b>Play Bench Boost</b> with this plan."
       : "• Suggestion: Save the chip for a stronger bench or a DGW.";
-    // Optional: show the first move for simplicity (same philosophy as /transfer's simple view)
-    const firstMove = (r.moves && r.moves[0])
-      ? `• Example move: OUT ${esc(r.moves[0].outName)} → IN ${esc(r.moves[0].inName)}`
+    const firstMove = (plan.moves && plan.moves[0])
+      ? `• Example move: OUT ${esc(plan.moves[0].outName)} → IN ${esc(plan.moves[0].inName)}`
       : "• Example move: (none)";
 
     blocks.push([line1, line2, line3, firstMove].join("\n"));
