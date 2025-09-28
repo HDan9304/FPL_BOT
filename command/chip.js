@@ -3,6 +3,7 @@
 // - For each plan (A..D), simulates your squad after those moves
 // - Scans next 6 GWs and suggests when to use TC, BB, FH, or Save/WC nudge
 // - Explanations stay short; logic matches your Pro EV settings
+// - Renders ALL transfers per plan (not just the first)
 
 import { send } from "../utils/telegram.js";
 import { esc } from "../utils/fmt.js";
@@ -103,6 +104,18 @@ export default async function chip(env, chatId) {
     const lines = [];
     lines.push(`${B(title)}`);
     lines.push(`• Net after hits: ${(p.net>=0?"+":"")}${p.net.toFixed(1)} | Moves: ${p.moves.length}`);
+
+    // FULL transfer list (every move)
+    if (p.moves && p.moves.length) {
+      lines.push("• Transfers:");
+      p.moves.forEach((m, i) => {
+        lines.push(`   ${i+1}) OUT ${esc(m.outName)} (${esc(m.outTeam)}) → IN ${esc(m.inName)} (${esc(m.inTeam)})`);
+      });
+    } else {
+      lines.push("• Transfers: (none)");
+    }
+
+    // Chip recommendations (simple)
     if (chipRecs.tc) lines.push(`• Triple Captain: ${chipRecs.tc.when} — ${chipRecs.tc.why}`);
     if (chipRecs.bb) lines.push(`• Bench Boost: ${chipRecs.bb.when} — ${chipRecs.bb.why}`);
     if (chipRecs.fh) lines.push(`• Free Hit: ${chipRecs.fh.when} — ${chipRecs.fh.why}`);
@@ -110,9 +123,6 @@ export default async function chip(env, chatId) {
     if (!chipRecs.tc && !chipRecs.bb && !chipRecs.fh && !chipRecs.wc) {
       lines.push("• No chip needed soon — manage with normal transfers.");
     }
-    // Show a single example move for context (simple view)
-    const m0 = (p.moves && p.moves[0]);
-    if (m0) lines.push(`• Example move: OUT ${esc(m0.outName)} → IN ${esc(m0.inName)}`);
 
     blocks.push(lines.join("\n"));
   }
@@ -270,7 +280,7 @@ function suggestChipsForRows(rows, windows, elements, fixtures, avail){
     if (pick) out.fh = { when: `GW ${pick.gw}`, why: `large blank (~${pick.expectedStarters} starters without hits)` };
   }
 
-  // WC: nudge only if many risks soon (light touch here; your /wildcard & /wcsquad handle depth)
+  // WC: nudge only if many risks soon
   if (avail.wc > 0) {
     const pick = pickWildcardWindow(rows, windows);
     if (pick) out.wc = { when: `Before GW ${pick.beforeGw}`, why: "too many weak spots or bad fixture run ahead" };
@@ -290,7 +300,6 @@ function pickTripleCaptainWindow(rows, windows){
     const dgw = (counts?.[r.teamId] || 0) > 1 ? 0.10 : 0.0;
     const posBias = (r.posT === 3 || r.posT === 4) ? 0.02 : 0.00;
     return (r.ev || 0) * (1 + dgw + posBias);
-    // We already “bake” minutes/FDR into r.ev upstream.
   }
 
   for (const w of windows) {
@@ -307,7 +316,7 @@ function pickTripleCaptainWindow(rows, windows){
 function pickBenchBoostWindow(rows, windows){
   const xi = pickXI(rows); if (!xi) return null;
   const bench = benchRows(rows, xi);
-  const benchLikely = bench.length >= 3;            // we already filtered minutes in EV
+  const benchLikely = bench.length >= 3;
   const benchSumEV  = bench.reduce((s,r)=> s + (r.ev || 0), 0);
 
   for (const w of windows) {
@@ -330,11 +339,10 @@ function pickFreeHitWindow(rows, windows){
 }
 
 function pickWildcardWindow(rows, windows){
-  // Count very low EV/likely rotation: rough proxy = bottom 4 outfielders + backup GK
   const gk  = rows.filter(r => r.posT === 1).sort((a,b)=> b.ev - a.ev);
   const of  = rows.filter(r => r.posT !== 1).sort((a,b)=> a.ev - b.ev);
   const weak = of.slice(0,4).filter(r => (r.ev||0) < 2.0).length + (gk[1] && (gk[1].ev||0) < 2.0 ? 1 : 0);
-  const nearBlankWave = windows.find(w => w.blanks >= 6); // many teams blank in that GW
+  const nearBlankWave = windows.find(w => w.blanks >= 6);
   if (weak >= 3) return { beforeGw: windows[0].gw };
   if (nearBlankWave) return { beforeGw: nearBlankWave.gw };
   return null;
@@ -348,7 +356,7 @@ function pickXI(rows){
   const mid = rows.filter(r => r.posT === 3).sort((a,b)=> b.ev - a.ev);
   const fwd = rows.filter(r => r.posT === 4).sort((a,b)=> b.ev - a.ev);
   if (!gk.length) return null;
-  const forms = [[3,4,3],[3,5,2],[4,4,2],[4,3,3],[4,5,1],[5,3,2],[5,4,1],[5,2,3]];
+  const forms = [[3,4,3],[3,5,2],[4,4,2],[4,3,3],[5,3,2],[5,4,1]];
   let best = null;
   for (const [D,M,F] of forms){
     if (def.length < D || mid.length < M || fwd.length < F) continue;
